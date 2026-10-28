@@ -86,6 +86,8 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
     // menu bar
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let songMenuItem = NSMenuItem(title: "Not playing", action: nil, keyEquivalent: "")
+    let playPauseMenuItem = NSMenuItem(title: "Play", action: #selector(togglePlayPause), keyEquivalent: "")
+    let popupsMenuItem = NSMenuItem(title: "Show popups", action: #selector(togglePopupsFromMenu), keyEquivalent: "")
     let menuBarChars = 28  // fixed width in a monospaced font so the rolling text doesn't jiggle the bar
     var scrollOffset = 0
     var ticker: Timer?
@@ -94,6 +96,7 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
     var window: NSWindow?
     var loginBox: NSButton?
     var loginNote: NSTextField?
+    var popupsBox: NSButton?
 
     var isPlaying: Bool { (state["playing"] as? Bool) == true }
     var songLine: String {
@@ -112,6 +115,17 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
         songMenuItem.isEnabled = false
         menu.addItem(songMenuItem)
         menu.addItem(.separator())
+        let previous = NSMenuItem(title: "Previous", action: #selector(previousTrack), keyEquivalent: "")
+        let next = NSMenuItem(title: "Next", action: #selector(nextTrack), keyEquivalent: "")
+        for (item, symbol) in [(previous, "backward.fill"), (playPauseMenuItem, "playpause.fill"), (next, "forward.fill")] {
+            item.target = self
+            item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: item.title)
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
+        popupsMenuItem.target = self
+        popupsMenuItem.state = Flag.showPopups.isOn ? .on : .off
+        menu.addItem(popupsMenuItem)
         menu.addItem(withTitle: "Settings…", action: #selector(showSettings), keyEquivalent: ",").target = self
         menu.addItem(withTitle: "Quit Song Notifier", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         statusItem.menu = menu
@@ -234,12 +248,25 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)
     }
 
+    // MARK: music controls (media-control talks to whatever app owns Now Playing)
+
+    func control(_ command: String) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/media-control")
+        p.arguments = [command]
+        try? p.run()
+    }
+    @objc func previousTrack() { control("previous-track") }
+    @objc func nextTrack() { control("next-track") }
+    @objc func togglePlayPause() { control("toggle-play-pause") }
+
     // MARK: menu bar
 
     func refreshMenuBar() {
         statusItem.isVisible = Flag.showInMenuBar.isOn
         let line = songLine
         songMenuItem.title = line.isEmpty ? "Not playing" : line
+        playPauseMenuItem.title = isPlaying ? "Pause" : "Play"
         guard statusItem.isVisible, let button = statusItem.button else { return }
 
         guard !line.isEmpty else { button.title = "♫"; return }
@@ -279,6 +306,7 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
         menubar.state = Flag.showInMenuBar.isOn ? .on : .off
         scroll.state = Flag.scrollTitle.isOn ? .on : .off
         popups.state = Flag.showPopups.isOn ? .on : .off
+        popupsBox = popups
         loginBox = login
 
         let note = NSTextField(wrappingLabelWithString: "")
@@ -340,7 +368,15 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
     }
     @objc func toggleMenuBar(_ s: NSButton) { Flag.showInMenuBar.set(s.state == .on); refreshMenuBar() }
     @objc func toggleScroll(_ s: NSButton) { Flag.scrollTitle.set(s.state == .on); scrollOffset = 0; refreshMenuBar() }
-    @objc func togglePopups(_ s: NSButton) { Flag.showPopups.set(s.state == .on) }
+    @objc func togglePopups(_ s: NSButton) { setPopups(s.state == .on) }
+    @objc func togglePopupsFromMenu() { setPopups(!Flag.showPopups.isOn) }
+
+    // one place keeps the menu item and the settings checkbox in step; popups off still keeps the menu bar title
+    func setPopups(_ on: Bool) {
+        Flag.showPopups.set(on)
+        popupsMenuItem.state = on ? .on : .off
+        popupsBox?.state = on ? .on : .off
+    }
 }
 
 let app = NSApplication.shared
