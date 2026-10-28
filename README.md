@@ -30,7 +30,7 @@ brew tap ungive/media-control && brew install media-control
 ./build.sh
 ```
 
-`build.sh` compiles the app, renders the icon, signs it ad-hoc, installs
+`build.sh` compiles the app into `~/Applications/SongNotifier.app`, renders the icon, signs it ad-hoc, installs
 `~/Library/LaunchAgents/com.quan.song-notifier.plist`, and starts it.
 On first run, allow notifications from **Song Notifier** when macOS asks
 (or in System Settings → Notifications).
@@ -38,7 +38,7 @@ On first run, allow notifications from **Song Notifier** when macOS asks
 ## Custom icon picture
 
 Drop any square-ish picture at `tools/icon-source.jpg` (or `.png`) and run `./build.sh` —
-it is cropped into a macOS rounded square with a ♫ badge. Without it, the code-drawn icon is used.
+it is cropped to a full-bleed square with a ♫ badge (macOS applies the rounded mask). Without it, the code-drawn icon is used.
 The picture is git-ignored, so third-party artwork stays out of the repo.
 
 ## Manage
@@ -48,7 +48,7 @@ launchctl kickstart -k gui/$(id -u)/com.quan.song-notifier                      
 launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.quan.song-notifier.plist  # stop
 ```
 
-Uninstall: stop it, then delete the LaunchAgent plist and this folder.
+Uninstall: stop it, then delete the LaunchAgent plist, `~/Applications/SongNotifier.app`, and this folder.
 
 ## Files
 
@@ -58,11 +58,13 @@ Uninstall: stop it, then delete the LaunchAgent plist and this folder.
 | `Info.plist` | App bundle metadata (bundle id, background-only, icon) |
 | `com.quan.song-notifier.plist` | LaunchAgent template (`build.sh` fills in the path) |
 | `tools/make-icon.swift` | Draws the default icon in code: a nervous pink-haired guitarist girl with headphones |
-| `tools/make-icon-from-image.swift` | Turns any picture into an icon (squircle crop + music-note badge) |
+| `tools/make-icon-from-image.swift` | Turns any picture into an icon (full-bleed square crop + music-note badge) |
 | `build.sh` | Build + install + (re)start |
 
 ## Troubleshooting
 
 - **No popup:** check System Settings → Notifications → Song Notifier, and Focus mode.
 - **Old icon showing:** `killall NotificationCenter Dock` (macOS caches icons).
+- **Blank icon in the popup:** macOS caches the notification icon per bundle id, including a blank
+  one from a build that had no icon yet. Bump `CFBundleIdentifier` in `Info.plist` and rebuild.
 - **Stopped working after a brew cleanup:** `media-control` must be at `/opt/homebrew/bin/media-control`.

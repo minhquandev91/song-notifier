@@ -3,7 +3,8 @@
 set -euo pipefail
 cd "${0:A:h}"
 
-APP=SongNotifier.app
+# Installed in ~/Applications: macOS leaves the notification icon blank for apps in arbitrary folders.
+APP=~/Applications/SongNotifier.app
 AGENT=com.quan.song-notifier
 PLIST=~/Library/LaunchAgents/$AGENT.plist
 
@@ -15,7 +16,7 @@ mkdir -p $APP/Contents/MacOS $APP/Contents/Resources
 cp Info.plist $APP/Contents/Info.plist
 swiftc -O SongNotifier.swift -o $APP/Contents/MacOS/song-notifier
 
-# icon: use tools/icon-source.{jpg,png} if present (squircle crop + note badge),
+# icon: use tools/icon-source.{jpg,png} if present (full-bleed crop + note badge),
 # otherwise the code-drawn icon. Then build the .icns.
 TMP=$(mktemp -d)
 ICON_PNG=tools/icon1024.png
@@ -38,10 +39,12 @@ done
 iconutil -c icns $ICONSET -o $APP/Contents/Resources/AppIcon.icns
 
 codesign --force --deep -s - $APP
+# re-register the rebuilt bundle, otherwise the notification popup can show a blank icon
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f $APP
 
-# login agent: point it at this checkout and (re)start it
-sed "s#__APP_BINARY__#$PWD/$APP/Contents/MacOS/song-notifier#" $AGENT.plist > $PLIST
+# login agent: point it at the installed app and (re)start it
+sed "s#__APP_BINARY__#$APP/Contents/MacOS/song-notifier#" $AGENT.plist > $PLIST
 launchctl bootout gui/$(id -u) $PLIST 2>/dev/null || true
 launchctl bootstrap gui/$(id -u) $PLIST
-killall NotificationCenter 2>/dev/null || true
+killall usernoted NotificationCenter 2>/dev/null || true
 echo "Built and started $APP"
