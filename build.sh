@@ -15,14 +15,25 @@ mkdir -p $APP/Contents/MacOS $APP/Contents/Resources
 cp Info.plist $APP/Contents/Info.plist
 swiftc -O SongNotifier.swift -o $APP/Contents/MacOS/song-notifier
 
-# icon: render 1024px PNG from code, then build the .icns
-swiftc tools/make-icon.swift -o /tmp/song-notifier-make-icon
-/tmp/song-notifier-make-icon tools/icon1024.png
-ICONSET=$(mktemp -d)/AppIcon.iconset
+# icon: use tools/icon-source.{jpg,png} if present (squircle crop + note badge),
+# otherwise the code-drawn icon. Then build the .icns.
+TMP=$(mktemp -d)
+ICON_PNG=tools/icon1024.png
+swiftc tools/make-icon.swift -o $TMP/make-icon
+$TMP/make-icon tools/icon1024.png
+for src in tools/icon-source.jpg tools/icon-source.png; do
+  if [[ -f $src ]]; then
+    swiftc tools/make-icon-from-image.swift -o $TMP/make-icon-from-image
+    $TMP/make-icon-from-image $src $TMP/icon-from-image.png
+    ICON_PNG=$TMP/icon-from-image.png
+    break
+  fi
+done
+ICONSET=$TMP/AppIcon.iconset
 mkdir -p $ICONSET
 for s in 16 32 128 256 512; do
-  sips -z $s $s tools/icon1024.png --out $ICONSET/icon_${s}x${s}.png >/dev/null
-  sips -z $((s*2)) $((s*2)) tools/icon1024.png --out $ICONSET/icon_${s}x${s}@2x.png >/dev/null
+  sips -z $s $s $ICON_PNG --out $ICONSET/icon_${s}x${s}.png >/dev/null
+  sips -z $((s*2)) $((s*2)) $ICON_PNG --out $ICONSET/icon_${s}x${s}@2x.png >/dev/null
 done
 iconutil -c icns $ICONSET -o $APP/Contents/Resources/AppIcon.icns
 

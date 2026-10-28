@@ -35,6 +35,12 @@ brew tap ungive/media-control && brew install media-control
 On first run, allow notifications from **Song Notifier** when macOS asks
 (or in System Settings → Notifications).
 
+## Custom icon picture
+
+Drop any square-ish picture at `tools/icon-source.jpg` (or `.png`) and run `./build.sh` —
+it is cropped into a macOS rounded square with a ♫ badge. Without it, the code-drawn icon is used.
+The picture is git-ignored, so third-party artwork stays out of the repo.
+
 ## Manage
 
 ```sh
@@ -51,7 +57,8 @@ Uninstall: stop it, then delete the LaunchAgent plist and this folder.
 | `SongNotifier.swift` | The app: reads the `media-control stream` JSON, debounces, posts notifications |
 | `Info.plist` | App bundle metadata (bundle id, background-only, icon) |
 | `com.quan.song-notifier.plist` | LaunchAgent template (`build.sh` fills in the path) |
-| `tools/make-icon.swift` | Draws the icon in code: a nervous pink-haired guitarist girl with headphones |
+| `tools/make-icon.swift` | Draws the default icon in code: a nervous pink-haired guitarist girl with headphones |
+| `tools/make-icon-from-image.swift` | Turns any picture into an icon (squircle crop + music-note badge) |
 | `build.sh` | Build + install + (re)start |
 
 ## Troubleshooting

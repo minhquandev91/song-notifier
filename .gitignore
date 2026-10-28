@@ -1,2 +1,4 @@
 SongNotifier.app/
 .DS_Store
+# personal icon picture (third-party artwork, keep out of the repo)
+tools/icon-source.*
