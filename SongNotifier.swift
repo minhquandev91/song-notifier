@@ -6,7 +6,8 @@ import UserNotifications
 // optionally with the song rolling through the menu bar. Clicking a popup focuses the player.
 
 // A second copy (e.g. started by hand) would double every popup; the running one wins.
-if let id = Bundle.main.bundleIdentifier,
+let snapshotMode = CommandLine.arguments.contains("--snapshot")
+if !snapshotMode, let id = Bundle.main.bundleIdentifier,
    NSRunningApplication.runningApplications(withBundleIdentifier: id).contains(where: { $0.processIdentifier != getpid() }) {
     exit(0)
 }
@@ -130,6 +131,7 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
     var loginBox: NSButton?
     var loginNote: NSTextField?
     var popupsBox: NSButton?
+    var settingsStack: NSStackView?
 
     var isPlaying: Bool { (state["playing"] as? Bool) == true }
     var songLine: String {
@@ -139,6 +141,10 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
     }
 
     func applicationDidFinishLaunching(_ n: Notification) {
+        if let i = CommandLine.arguments.firstIndex(of: "--snapshot"), i + 1 < CommandLine.arguments.count {
+            snapshot(into: CommandLine.arguments[i + 1])  // layout QA: `song-notifier --snapshot <dir>`
+            exit(0)
+        }
         un.delegate = self
         un.requestAuthorization(options: [.alert]) { granted, err in
             print("notification permission granted:", granted, err?.localizedDescription ?? "")
@@ -294,59 +300,64 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
         try? p.run()
     }
 
-    // Now-playing card at the top of the menu: artwork on the left; title, artist and the ⏮ ⏯ ⏭ icon
-    // buttons stacked on the right. Clicking a button doesn't close the menu, so the play/pause icon
-    // can be seen flipping. Menu item views get a fixed frame, hence the fixed sizes.
+    // Now-playing card at the top of the menu: artwork on the left; on the right the title and artist are
+    // pinned to the artwork's top edge and the ⏮ ⏯ ⏭ icon buttons to its bottom edge, so both columns share
+    // top and bottom lines. Play/pause is the biggest control. Clicking a button doesn't close the menu, so the
+    // play/pause icon can be seen flipping. Menu item views get a fixed frame, hence the fixed sizes.
     func makeCard() -> NSView {
-        let textWidth: CGFloat = 220, art: CGFloat = 96, pad: CGFloat = 16
+        let textWidth: CGFloat = 220, art: CGFloat = 96, pad: CGFloat = 16, gap: CGFloat = 14
 
-        func button(_ symbol: String, _ tip: String, _ action: Selector) -> NSButton {
+        func button(_ symbol: String, _ tip: String, _ action: Selector, size: CGFloat, width: CGFloat) -> NSButton {
             let b = NSButton(image: NSImage(systemSymbolName: symbol, accessibilityDescription: tip) ?? NSImage(),
                              target: self, action: action)
             b.isBordered = false
-            b.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 22, weight: .regular)
+            b.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: size, weight: .semibold)
             b.contentTintColor = .labelColor
             b.toolTip = tip
-            b.heightAnchor.constraint(equalToConstant: 34).isActive = true
+            b.widthAnchor.constraint(equalToConstant: width).isActive = true
+            b.heightAnchor.constraint(equalToConstant: 36).isActive = true
             return b
         }
-        let playPause = button("play.fill", "Play / Pause", #selector(togglePlayPause))
+        let playPause = button("play.fill", "Play / Pause", #selector(togglePlayPause), size: 28, width: 44)
         playPauseButton = playPause
-        let controls = NSStackView(views: [button("backward.fill", "Previous", #selector(previousTrack)),
+        let controls = NSStackView(views: [button("backward.fill", "Previous", #selector(previousTrack), size: 17, width: 32),
                                            playPause,
-                                           button("forward.fill", "Next", #selector(nextTrack))])
+                                           button("forward.fill", "Next", #selector(nextTrack), size: 17, width: 32)])
         controls.orientation = .horizontal
         controls.alignment = .centerY
-        controls.distribution = .fillEqually
+        controls.spacing = 4
+        controls.translatesAutoresizingMaskIntoConstraints = false
 
         titleLabel.font = .systemFont(ofSize: 15, weight: .semibold)
+        titleLabel.lineBreakMode = .byWordWrapping  // wrap first; truncating mode would stop at one line
         titleLabel.maximumNumberOfLines = 2
-        titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.cell?.truncatesLastVisibleLine = true
+        titleLabel.preferredMaxLayoutWidth = textWidth
         artistLabel.font = .systemFont(ofSize: 12)
         artistLabel.textColor = .secondaryLabelColor
         artistLabel.lineBreakMode = .byTruncatingTail
-
-        let column = NSStackView(views: [titleLabel, artistLabel, controls])
-        column.orientation = .vertical
-        column.alignment = .leading
-        column.spacing = 3
-        column.setCustomSpacing(8, after: artistLabel)
-        column.translatesAutoresizingMaskIntoConstraints = false
-        for v in [titleLabel, artistLabel, controls] { v.widthAnchor.constraint(equalToConstant: textWidth).isActive = true }
-        titleLabel.heightAnchor.constraint(equalToConstant: 38).isActive = true  // room for two lines, top-aligned
-
+        for l in [titleLabel, artistLabel] { l.translatesAutoresizingMaskIntoConstraints = false }
         artworkView.translatesAutoresizingMaskIntoConstraints = false
-        let height = art + 2 * pad
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: pad + art + 14 + textWidth + pad, height: height))
-        container.addSubview(artworkView)
-        container.addSubview(column)
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: pad + art + gap + textWidth + pad, height: art + 2 * pad))
+        for v in [artworkView, titleLabel, artistLabel, controls] { container.addSubview(v) }
+        let textLeading = artworkView.trailingAnchor
         NSLayoutConstraint.activate([
             artworkView.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: pad),
-            artworkView.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            artworkView.topAnchor.constraint(equalTo: container.topAnchor, constant: pad),
             artworkView.widthAnchor.constraint(equalToConstant: art),
             artworkView.heightAnchor.constraint(equalToConstant: art),
-            column.leadingAnchor.constraint(equalTo: artworkView.trailingAnchor, constant: 14),
-            column.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+
+            titleLabel.leadingAnchor.constraint(equalTo: textLeading, constant: gap),
+            titleLabel.widthAnchor.constraint(equalToConstant: textWidth),
+            titleLabel.topAnchor.constraint(equalTo: artworkView.topAnchor, constant: -1),  // optical: cap height meets the artwork top
+            artistLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            artistLabel.widthAnchor.constraint(equalToConstant: textWidth),
+            artistLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 2),
+
+            // the first glyph sits ~3pt inside its button; shift the row left so the glyph lines up with the text
+            controls.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor, constant: -3),
+            controls.bottomAnchor.constraint(equalTo: artworkView.bottomAnchor, constant: 2),
         ])
         return container
     }
@@ -391,6 +402,7 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
         syncLoginBox()
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
+        window?.makeFirstResponder(nil)  // no focus ring on the first checkbox when the window opens
     }
 
     func checkbox(_ title: String, _ action: Selector) -> NSButton {
@@ -427,19 +439,69 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 10
-        stack.setCustomSpacing(2, after: login)
+        stack.setCustomSpacing(16, after: login)  // group break; tightened to 2 while the note below it is shown
+        stack.setCustomSpacing(16, after: note)
+        settingsStack = stack
+        note.isHidden = true  // only shown when there is something to say; hidden views take no space
         stack.setCustomSpacing(16, after: hint)
-        stack.edgeInsets = NSEdgeInsets(top: 20, left: 22, bottom: 20, right: 22)
-        hint.preferredMaxLayoutWidth = 320
-        note.preferredMaxLayoutWidth = 320
+        // wrapping labels need a real width, or the window grows to the text and the right inset disappears
+        for label in [hint, note] { label.widthAnchor.constraint(equalToConstant: 304).isActive = true }
 
         let w = NSWindow(contentRect: .zero, styleMask: [.titled, .closable], backing: .buffered, defer: false)
         w.title = "Song Notifier"
-        w.contentView = stack
+        // explicit margins: the window sizes itself from this container, and NSStackView's own insets
+        // left the right-hand margin out of its fitting size
+        let content = NSView()
+        content.addSubview(stack)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 22),
+            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -22),
+            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
+            stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
+        ])
+        w.contentView = content
         w.isReleasedWhenClosed = false
-        w.setContentSize(stack.fittingSize)
+        w.setContentSize(content.fittingSize)
         w.center()
         window = w
+    }
+
+    // MARK: layout QA
+
+    // Renders the menu card and the settings window with sample data, light and dark, to PNGs in `dir`.
+    func snapshot(into dir: String) {
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        func render(_ view: NSView, name: String) {
+            for dark in [false, true] {
+                let w = NSWindow(contentRect: view.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+                w.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
+                w.contentView = view
+                w.setContentSize(view.frame.size)
+                view.layoutSubtreeIfNeeded()
+                view.wantsLayer = true
+                w.appearance?.performAsCurrentDrawingAppearance {
+                    view.layer?.backgroundColor = (name.hasPrefix("card") ? NSColor.underPageBackgroundColor : NSColor.windowBackgroundColor).cgColor
+                }
+                let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds)!
+                view.cacheDisplay(in: view.bounds, to: rep)
+                try? rep.representation(using: .png, properties: [:])?
+                    .write(to: URL(fileURLWithPath: "\(dir)/\(name)-\(dark ? "dark" : "light").png"))
+            }
+        }
+        let card = makeCard()
+        titleLabel.stringValue = "BÊN ÁY EM CÓ AI RỒI - CHÂU KHẢI PHONG | CA SĨ GIẤU MẶT COVER"
+        artistLabel.stringValue = "Beta Music"
+        artworkView.show(NSImage(contentsOfFile: "tools/icon1024.png"))
+        playPauseButton?.image = NSImage(systemSymbolName: "pause.fill", accessibilityDescription: nil)
+        render(card, name: "card-long")
+        titleLabel.stringValue = "Not playing"
+        artistLabel.stringValue = ""
+        artworkView.show(nil)
+        playPauseButton?.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: nil)
+        render(card, name: "card-idle")
+        buildWindow()
+        if let content = window?.contentView { render(content, name: "settings") }
     }
 
     func syncLoginBox() {
@@ -453,6 +515,10 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
         default:
             loginNote?.stringValue = ""
         }
+        let noteShown = !(loginNote?.stringValue.isEmpty ?? true)
+        loginNote?.isHidden = !noteShown
+        if let login = loginBox { settingsStack?.setCustomSpacing(noteShown ? 2 : 16, after: login) }
+        if let w = window, let content = w.contentView { w.setContentSize(content.fittingSize) }
     }
 
     @objc func toggleLogin(_ sender: NSButton) {

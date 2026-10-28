@@ -71,6 +71,9 @@ Requires macOS 13+ on Apple Silicon (tested on macOS 27).
 if you want it at startup, and allow notifications from **Song Notifier** when macOS asks
 (or in System Settings → Notifications).
 
+UI layout check: `~/Applications/SongNotifier.app/Contents/MacOS/song-notifier --snapshot /tmp/ui` renders the
+menu card and settings window (light and dark) to PNGs without showing anything on screen.
+
 ## Custom icon picture
 
 Drop any square-ish picture at `tools/icon-source.jpg` (or `.png`) and run `./build.sh` —
