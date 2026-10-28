@@ -102,6 +102,87 @@ final class ArtworkView: NSView {
     }
 }
 
+// MARK: - Soundwave
+
+// Five small equalizer bars (pink → violet, like the icon badge) that bounce while music plays
+// and rest as short bars when it is paused. Driven by a timer that only runs while the view is on
+// screen and playing: Core Animation animations get dropped whenever a menu closes.
+final class WaveView: NSView {
+    private let bars: [CALayer] = (0..<5).map { _ in CALayer() }
+    private let barWidth: CGFloat = 3, barGap: CGFloat = 3
+    private let rest: [CGFloat] = Array(repeating: 0.22, count: 5)
+    private let periods: [Double] = [0.55, 0.80, 0.65, 0.95, 0.70]  // seconds per up-down cycle
+    private let lows: [CGFloat] = [0.25, 0.15, 0.30, 0.20, 0.28]
+    private let highs: [CGFloat] = [0.85, 1.00, 0.70, 0.95, 0.80]
+    private var timer: Timer?
+
+    var isActive = false {
+        didSet { if oldValue != isActive { sync() } }
+    }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        for (i, bar) in bars.enumerated() {
+            let t = CGFloat(i) / CGFloat(bars.count - 1)
+            bar.backgroundColor = NSColor(srgbRed: 1.0 + (0.55 - 1.0) * t, green: 0.45 + (0.35 - 0.45) * t,
+                                          blue: 0.70 + (0.95 - 0.70) * t, alpha: 1).cgColor
+            bar.cornerRadius = barWidth / 2
+            layer?.addSublayer(bar)
+        }
+        setLevels(rest)
+    }
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: CGFloat(bars.count) * barWidth + CGFloat(bars.count - 1) * barGap, height: 22)
+    }
+
+    override func layout() {
+        super.layout()
+        for (i, bar) in bars.enumerated() {
+            bar.bounds = CGRect(x: 0, y: 0, width: barWidth, height: bounds.height)
+            bar.position = CGPoint(x: barWidth / 2 + CGFloat(i) * (barWidth + barGap), y: bounds.midY)
+        }
+    }
+
+    // the menu detaches/re-attaches its views every time it closes/opens
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        sync()
+    }
+
+    private func sync() {
+        if isActive && window != nil {
+            guard timer == nil else { return }
+            // .common so it keeps firing while the menu is open (event-tracking run loop mode)
+            let t = Timer(timeInterval: 1.0 / 24, repeats: true) { [weak self] _ in self?.tick() }
+            RunLoop.main.add(t, forMode: .common)
+            timer = t
+        } else {
+            timer?.invalidate()
+            timer = nil
+            setLevels(rest)
+        }
+    }
+
+    private func tick() {
+        let now = CACurrentMediaTime()
+        setLevels((0..<bars.count).map { i in
+            let wave = 0.5 + 0.5 * sin(now / periods[i] * 2 * .pi + Double(i) * 1.1)
+            return lows[i] + (highs[i] - lows[i]) * CGFloat(wave)
+        })
+    }
+
+    // bar heights as 0...1 fractions of the view height (also used by the --snapshot layout check)
+    func setLevels(_ levels: [CGFloat]) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (bar, level) in zip(bars, levels) { bar.transform = CATransform3DMakeScale(1, level, 1) }
+        CATransaction.commit()
+    }
+}
+
 // MARK: - App
 
 final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
@@ -119,6 +200,7 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     var playPauseButton: NSButton?
     let artworkView = ArtworkView(frame: .zero)
+    let waveView = WaveView(frame: .zero)
     let titleLabel = NSTextField(wrappingLabelWithString: "Not playing")
     let artistLabel = NSTextField(labelWithString: "")
     let popupsMenuItem = NSMenuItem(title: "Show popups", action: #selector(togglePopupsFromMenu), keyEquivalent: "")
@@ -326,6 +408,11 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
         controls.orientation = .horizontal
         controls.alignment = .centerY
         controls.spacing = 4
+        controls.distribution = .equalSpacing  // spread ⏮ ⏯ ⏭ and the soundwave evenly across the text column
+        waveView.translatesAutoresizingMaskIntoConstraints = false
+        controls.addArrangedSubview(waveView)
+        waveView.widthAnchor.constraint(equalToConstant: waveView.intrinsicContentSize.width).isActive = true
+        waveView.heightAnchor.constraint(equalToConstant: waveView.intrinsicContentSize.height).isActive = true
         controls.translatesAutoresizingMaskIntoConstraints = false
 
         titleLabel.font = .systemFont(ofSize: 15, weight: .semibold)
@@ -357,6 +444,7 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
 
             // the first glyph sits ~3pt inside its button; shift the row left so the glyph lines up with the text
             controls.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor, constant: -3),
+            controls.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
             controls.bottomAnchor.constraint(equalTo: artworkView.bottomAnchor, constant: 2),
         ])
         return container
@@ -378,6 +466,7 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
         if artistLabel.stringValue != artist { artistLabel.stringValue = artist }
         let symbol = isPlaying ? "pause.fill" : "play.fill"
         playPauseButton?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Play / Pause")
+        waveView.isActive = isPlaying
         guard statusItem.isVisible, let button = statusItem.button else { return }
 
         guard !line.isEmpty else { button.title = "♫"; return }
@@ -494,6 +583,7 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
         artistLabel.stringValue = "Beta Music"
         artworkView.show(NSImage(contentsOfFile: "tools/icon1024.png"))
         playPauseButton?.image = NSImage(systemSymbolName: "pause.fill", accessibilityDescription: nil)
+        waveView.setLevels([0.55, 0.9, 0.4, 1.0, 0.65])
         render(card, name: "card-long")
         titleLabel.stringValue = "Not playing"
         artistLabel.stringValue = ""
