@@ -1,7 +1,22 @@
-import Foundation
+import AppKit
 import UserNotifications
 
 // Shows a macOS notification whenever the "Now Playing" song changes (browsers, Apple Music, Spotify).
+
+// Single instance: clicking a notification makes macOS launch the app again. The launchd-managed
+// copy (XPC_SERVICE_NAME == our label) wins; any other copy exits so popups are never doubled.
+// (A lock file is used because launchd-started processes are invisible to NSRunningApplication.)
+let isLaunchdInstance = ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"] == "com.quan.song-notifier"
+let lockPath = NSTemporaryDirectory() + "com.quan.song-notifier.lock"
+let lockFD = open(lockPath, O_RDWR | O_CREAT, 0o600)
+if flock(lockFD, LOCK_EX | LOCK_NB) != 0 {
+    guard isLaunchdInstance else { exit(0) }
+    let holder = (try? String(contentsOfFile: lockPath, encoding: .utf8)).flatMap { Int32($0) } ?? 0
+    if holder > 0 { kill(holder, SIGTERM) }
+    flock(lockFD, LOCK_EX)  // wait for the other copy to go away
+}
+ftruncate(lockFD, 0)
+_ = "\(getpid())".withCString { write(lockFD, $0, strlen($0)) }
 
 var lastTrack = ""
 
