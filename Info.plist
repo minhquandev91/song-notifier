@@ -22,5 +22,7 @@
 	<true/>
 	<key>NSAppleEventsUsageDescription</key>
 	<string>Song Notifier switches to the browser tab playing the song when you click a notification.</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>© 2026 RedhairedQuan</string>
 </dict>
 </plist>

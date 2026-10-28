@@ -290,11 +290,17 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
         hint.font = .systemFont(ofSize: 11)
         hint.textColor = .secondaryLabelColor
 
-        let stack = NSStackView(views: [login, note, menubar, scroll, popups, hint])
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
+        let copyright = NSTextField(labelWithString: "© 2026 RedhairedQuan · Version \(version)")
+        copyright.font = .systemFont(ofSize: 11)
+        copyright.textColor = .tertiaryLabelColor
+
+        let stack = NSStackView(views: [login, note, menubar, scroll, popups, hint, copyright])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 10
         stack.setCustomSpacing(2, after: login)
+        stack.setCustomSpacing(16, after: hint)
         stack.edgeInsets = NSEdgeInsets(top: 20, left: 22, bottom: 20, right: 22)
         hint.preferredMaxLayoutWidth = 320
         note.preferredMaxLayoutWidth = 320

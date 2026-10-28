@@ -99,3 +99,7 @@ Quit from the menu bar item. Uninstall: untick **Launch at login**, quit, then d
 ## License
 
 [MIT](LICENSE): free to use, modify and distribute.
+
+---
+
+Copyright © 2026 RedhairedQuan
