@@ -37,9 +37,13 @@ Open from the menu bar item (or by opening Song Notifier again if the item is hi
 ### Homebrew (easiest)
 
 ```sh
-brew install --cask minhquandev91/tap/song-notifier
+brew tap ungive/media-control && brew tap minhquandev91/tap
+brew trust ungive/media-control minhquandev91/tap
+brew install --cask song-notifier
 ```
 
+Recent Homebrew versions refuse to load anything from a tap you haven't trusted (the error says
+`Refusing to load ... from untrusted tap`), hence the `brew trust` line. Older versions don't have it; skip it there.
 This also installs [`media-control`](https://github.com/ungive/media-control), which the app needs to read what is playing.
 Then open **Song Notifier** and tick **Launch at login** if you want it at startup.
 
