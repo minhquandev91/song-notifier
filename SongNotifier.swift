@@ -86,7 +86,7 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
     // menu bar
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let songMenuItem = NSMenuItem(title: "Not playing", action: nil, keyEquivalent: "")
-    let playPauseMenuItem = NSMenuItem(title: "Play", action: #selector(togglePlayPause), keyEquivalent: "")
+    var playPauseButton: NSButton?
     let popupsMenuItem = NSMenuItem(title: "Show popups", action: #selector(togglePopupsFromMenu), keyEquivalent: "")
     let menuBarChars = 28  // fixed width in a monospaced font so the rolling text doesn't jiggle the bar
     var scrollOffset = 0
@@ -115,13 +115,9 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
         songMenuItem.isEnabled = false
         menu.addItem(songMenuItem)
         menu.addItem(.separator())
-        let previous = NSMenuItem(title: "Previous", action: #selector(previousTrack), keyEquivalent: "")
-        let next = NSMenuItem(title: "Next", action: #selector(nextTrack), keyEquivalent: "")
-        for (item, symbol) in [(previous, "backward.fill"), (playPauseMenuItem, "playpause.fill"), (next, "forward.fill")] {
-            item.target = self
-            item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: item.title)
-            menu.addItem(item)
-        }
+        let controls = NSMenuItem()
+        controls.view = makeControls()
+        menu.addItem(controls)
         menu.addItem(.separator())
         popupsMenuItem.target = self
         popupsMenuItem.state = Flag.showPopups.isOn ? .on : .off
@@ -256,6 +252,41 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
         p.arguments = [command]
         try? p.run()
     }
+
+    // ⏮ ⏯ ⏭ as icon buttons in one row, centred in the menu; clicking doesn't close the menu so the
+    // play/pause icon can be seen flipping.
+    func makeControls() -> NSView {
+        func button(_ symbol: String, _ tip: String, _ action: Selector) -> NSButton {
+            let b = NSButton(image: NSImage(systemSymbolName: symbol, accessibilityDescription: tip) ?? NSImage(),
+                             target: self, action: action)
+            b.isBordered = false
+            b.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 18, weight: .regular)
+            b.contentTintColor = .labelColor
+            b.toolTip = tip
+            b.widthAnchor.constraint(equalToConstant: 40).isActive = true
+            b.heightAnchor.constraint(equalToConstant: 30).isActive = true
+            return b
+        }
+        let previous = button("backward.fill", "Previous", #selector(previousTrack))
+        let playPause = button("play.fill", "Play / Pause", #selector(togglePlayPause))
+        let next = button("forward.fill", "Next", #selector(nextTrack))
+        playPauseButton = playPause
+
+        let row = NSStackView(views: [previous, playPause, next])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 20
+        row.translatesAutoresizingMaskIntoConstraints = false
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 38))
+        container.addSubview(row)
+        NSLayoutConstraint.activate([
+            row.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            row.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+        ])
+        return container
+    }
+
     @objc func previousTrack() { control("previous-track") }
     @objc func nextTrack() { control("next-track") }
     @objc func togglePlayPause() { control("toggle-play-pause") }
@@ -266,7 +297,8 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
         statusItem.isVisible = Flag.showInMenuBar.isOn
         let line = songLine
         songMenuItem.title = line.isEmpty ? "Not playing" : line
-        playPauseMenuItem.title = isPlaying ? "Pause" : "Play"
+        let symbol = isPlaying ? "pause.fill" : "play.fill"
+        playPauseButton?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Play / Pause")
         guard statusItem.isVisible, let button = statusItem.button else { return }
 
         guard !line.isEmpty else { button.title = "♫"; return }
