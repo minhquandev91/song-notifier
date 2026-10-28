@@ -17,13 +17,13 @@ in **any browser** (Edge, Chrome, Safari… e.g. YouTube, YouTube Music, Spotify
 ## How it works
 
 - Reads the system **Now Playing** info (the same data shown in Control Center) via
-  [`media-control`](https://github.com/ungive/media-control). Apple restricts direct access to
-  this on macOS 15.4+; `media-control` works around it.
+  [`media-control`](https://github.com/ungive/media-control), which is **bundled inside the app**: nothing else to install.
+  Apple restricts direct access to this on macOS 15.4+; `media-control` works around it.
 - Waits ~1 s after a change so late-arriving artist/album metadata lands in the same popup,
   and notifies once per track title (pause/resume does not re-notify).
 - Shows the song rolling through the menu bar (♫ item). Click it for a now-playing card: the player's artwork on
-  the left; title, artist and **⏮ ⏯ ⏭** icon buttons on the right (works for any player), with a small soundwave
-  that moves while music plays. Below it: a quick
+  the left (click it to jump to the player); title, artist and **⏮ ⏯ ⏭** icon buttons on the right (works for any
+  player), with a small soundwave that moves while music plays. Below it: a quick
   **Show popups** switch, **Settings…** and **Quit**.
 - Click a popup to jump to the player: the app comes to the front, and in Edge/Chrome/Brave/Vivaldi/Safari
   the tab playing the song is selected (macOS asks once to allow controlling the browser).
@@ -41,29 +41,28 @@ Open from the menu bar item (or by opening Song Notifier again if the item is hi
 ### Homebrew (easiest)
 
 ```sh
-brew tap ungive/media-control && brew tap minhquandev91/tap
-brew trust ungive/media-control minhquandev91/tap
+brew tap minhquandev91/tap
+brew trust minhquandev91/tap
 brew install --cask song-notifier
 ```
 
 Recent Homebrew versions refuse to load anything from a tap you haven't trusted (the error says
 `Refusing to load ... from untrusted tap`), hence the `brew trust` line. Older versions don't have it; skip it there.
-This also installs [`media-control`](https://github.com/ungive/media-control), which the app needs to read what is playing.
 Then open **Song Notifier** and tick **Launch at login** if you want it at startup.
 
 ### Manual download
 
-1. `brew tap ungive/media-control && brew install media-control`
-2. Download `SongNotifier-<version>.zip` from the [latest release](https://github.com/minhquandev91/song-notifier/releases/latest),
+1. Download `SongNotifier-<version>.zip` from the [latest release](https://github.com/minhquandev91/song-notifier/releases/latest),
    unzip it and move **SongNotifier.app** to `/Applications` (or `~/Applications`).
-3. The app is signed ad-hoc (not notarized), so macOS blocks the first launch: right-click the app → **Open** → **Open**,
+2. The app is signed ad-hoc (not notarized), so macOS blocks the first launch: right-click the app → **Open** → **Open**,
    or run `xattr -dr com.apple.quarantine /Applications/SongNotifier.app`.
 
-Requires macOS 13+ on Apple Silicon (tested on macOS 27).
+Requires macOS 13+ on Apple Silicon (tested on macOS 27). Nothing else needs installing.
 
 ## Build from source
 
 ```sh
+brew tap ungive/media-control && brew install media-control   # only so build.sh can copy it into the app
 ./build.sh
 ```
 
@@ -105,11 +104,14 @@ Quit from the menu bar item. Uninstall: untick **Launch at login**, quit, then d
 - **Old icon showing:** `killall NotificationCenter Dock` (macOS caches icons).
 - **Blank icon in the popup:** macOS caches the notification icon per bundle id, including a blank
   one from a build that had no icon yet. Bump `CFBundleIdentifier` in `Info.plist` and rebuild.
-- **Stopped working after a brew cleanup:** `media-control` must be at `/opt/homebrew/bin/media-control`.
 
 ## License
 
 [MIT](LICENSE): free to use, modify and distribute.
+
+The app bundles [`media-control`](https://github.com/ungive/media-control) and
+[`mediaremote-adapter`](https://github.com/ungive/mediaremote-adapter) by Jonas van den Berg (BSD 3-Clause);
+see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ---
 

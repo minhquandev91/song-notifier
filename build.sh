@@ -10,8 +10,11 @@ RELEASE=${RELEASE:-0}
 OLD_AGENT=com.quan.song-notifier  # pre-0.2.0 launchd agent, replaced by the in-app "Launch at login"
 OLD_PLIST=~/Library/LaunchAgents/$OLD_AGENT.plist
 
+# media-control is bundled into the app (users don't install it); it is copied from the Homebrew copy here.
 command -v media-control >/dev/null || {
-  echo "media-control missing: brew tap ungive/media-control && brew install media-control" >&2; exit 1; }
+  echo "media-control missing (needed to bundle it): brew tap ungive/media-control && brew install media-control" >&2; exit 1; }
+MC=${$(command -v media-control):A}  # resolve the symlink into the Cellar: <root>/bin/media-control
+MC_ROOT=${MC:h:h}
 
 if [[ $RELEASE != 1 ]]; then
   launchctl bootout gui/$(id -u) $OLD_PLIST 2>/dev/null || true
@@ -22,6 +25,12 @@ rm -rf $APP
 mkdir -p $APP/Contents/MacOS $APP/Contents/Resources
 cp Info.plist $APP/Contents/Info.plist
 swiftc -O -target arm64-apple-macos13.0 SongNotifier.swift -o $APP/Contents/MacOS/song-notifier
+
+# bundle media-control: its script finds the adapter via paths relative to itself, so keep the layout
+mkdir -p $APP/Contents/Resources/media-control
+cp -R $MC_ROOT/bin $MC_ROOT/lib $MC_ROOT/Frameworks $APP/Contents/Resources/media-control/
+chmod -R u+w $APP/Contents/Resources/media-control
+cp THIRD_PARTY_NOTICES.md $APP/Contents/Resources/
 
 # icon: use tools/icon-source.{jpg,png} if present (full-bleed crop + note badge),
 # otherwise the code-drawn icon. Then build the .icns.

@@ -95,12 +95,23 @@ final class ArtworkView: NSView {
     }
     required init?(coder: NSCoder) { fatalError("not used") }
 
+    // clicking the artwork opens the player (set by the controller)
+    var onClick: (() -> Void)?
+    override func mouseDown(with event: NSEvent) { onClick?() }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .pointingHand) }
+
     func show(_ image: NSImage?) {
         let cg = image?.cgImage(forProposedRect: nil, context: nil, hints: nil)
         layer?.contents = cg
         placeholder.isHidden = cg != nil
     }
 }
+
+// MARK: - media-control helper
+
+// build.sh bundles media-control into the app, so users never install it separately.
+let mediaControlURL = Bundle.main.resourceURL?.appendingPathComponent("media-control/bin/media-control")
 
 // MARK: - Soundwave
 
@@ -303,8 +314,9 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
     // MARK: now-playing stream
 
     func startStream() {
+        guard let tool = mediaControlURL else { print("bundled media-control not found"); return }
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/media-control")
+        proc.executableURL = tool
         proc.arguments = ["stream"]
         let pipe = Pipe()
         proc.standardOutput = pipe
@@ -376,8 +388,9 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
     // MARK: music controls (media-control talks to whatever app owns Now Playing)
 
     func control(_ command: String) {
+        guard let tool = mediaControlURL else { return }
         let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/media-control")
+        p.executableURL = tool
         p.arguments = [command]
         try? p.run()
     }
@@ -425,6 +438,8 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
         artistLabel.lineBreakMode = .byTruncatingTail
         for l in [titleLabel, artistLabel] { l.translatesAutoresizingMaskIntoConstraints = false }
         artworkView.translatesAutoresizingMaskIntoConstraints = false
+        artworkView.toolTip = "Open the player"
+        artworkView.onClick = { [weak self] in self?.openPlayer() }
 
         let container = NSView(frame: NSRect(x: 0, y: 0, width: pad + art + gap + textWidth + pad, height: art + 2 * pad))
         for v in [artworkView, titleLabel, artistLabel, controls] { container.addSubview(v) }
@@ -448,6 +463,14 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
             controls.bottomAnchor.constraint(equalTo: artworkView.bottomAnchor, constant: 2),
         ])
         return container
+    }
+
+    // Artwork clicked: close the menu and bring the player (and, for browsers, the song's tab) to the front.
+    func openPlayer() {
+        statusItem.menu?.cancelTracking()
+        focusPlayer(bundleID: state["bundleIdentifier"] as? String,
+                    pid: state["processIdentifier"] as? Int32,
+                    title: state["title"] as? String)
     }
 
     @objc func previousTrack() { control("previous-track") }
