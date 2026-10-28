@@ -2,7 +2,7 @@
 
 <img src="tools/icon1024.png" width="128" align="right" alt="icon">
 
-A tiny macOS menu-less app that pops up a notification whenever the song changes —
+A tiny macOS menu bar app that pops up a notification whenever the song changes —
 in **any browser** (Edge, Chrome, Safari… e.g. YouTube, YouTube Music, Spotify Web),
 **Apple Music**, or **Spotify**.
 
@@ -21,7 +21,16 @@ in **any browser** (Edge, Chrome, Safari… e.g. YouTube, YouTube Music, Spotify
   this on macOS 15.4+; `media-control` works around it.
 - Waits ~1 s after a change so late-arriving artist/album metadata lands in the same popup,
   and notifies once per track title (pause/resume does not re-notify).
-- Runs as a background agent (`LSUIElement`, no Dock icon), started at login by launchd.
+- Shows the song rolling through the menu bar (♫ item); click it for **Settings…** and **Quit**.
+- Click a popup to jump to the player: the app comes to the front, and in Edge/Chrome/Brave/Vivaldi/Safari
+  the tab playing the song is selected (macOS asks once to allow controlling the browser).
+- Runs as a background app (`LSUIElement`, no Dock icon).
+
+## Settings
+
+Open from the menu bar item (or by opening Song Notifier again if the item is hidden):
+**Launch at login** (a regular macOS login item, listed in System Settings → General → Login Items),
+**show the song in the menu bar**, **roll long titles**, and **show popups**.
 
 ## Install
 
@@ -30,9 +39,9 @@ brew tap ungive/media-control && brew install media-control
 ./build.sh
 ```
 
-`build.sh` compiles the app into `~/Applications/SongNotifier.app`, renders the icon, signs it ad-hoc, installs
-`~/Library/LaunchAgents/com.quan.song-notifier.plist`, and starts it.
-On first run, allow notifications from **Song Notifier** when macOS asks
+`build.sh` compiles the app into `~/Applications/SongNotifier.app`, renders the icon, signs it ad-hoc, and starts it
+(it also removes the pre-0.2.0 launchd agent). On first run the Settings window opens: tick **Launch at login**
+if you want it at startup, and allow notifications from **Song Notifier** when macOS asks
 (or in System Settings → Notifications).
 
 ## Custom icon picture
@@ -43,23 +52,18 @@ The picture is git-ignored, so third-party artwork stays out of the repo.
 
 ## Manage
 
-```sh
-launchctl kickstart -k gui/$(id -u)/com.quan.song-notifier                       # restart
-launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.quan.song-notifier.plist  # stop
-```
-
-Uninstall: stop it, then delete the LaunchAgent plist, `~/Applications/SongNotifier.app`, and this folder.
+Quit from the menu bar item. Uninstall: untick **Launch at login**, quit, then delete
+`~/Applications/SongNotifier.app` and this folder.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `SongNotifier.swift` | The app: reads the `media-control stream` JSON, debounces, posts notifications |
+| `SongNotifier.swift` | The app: reads the `media-control stream` JSON, posts notifications, menu bar item, settings window |
 | `Info.plist` | App bundle metadata (bundle id, background-only, icon) |
-| `com.quan.song-notifier.plist` | LaunchAgent template (`build.sh` fills in the path) |
 | `tools/make-icon.swift` | Draws the default icon in code: a nervous pink-haired guitarist girl with headphones |
 | `tools/make-icon-from-image.swift` | Turns any picture into an icon (full-bleed square crop + music-note badge) |
-| `build.sh` | Build + install + (re)start |
+| `build.sh` | Build + install + (re)start (and remove the old launchd agent) |
 
 ## Troubleshooting
 

@@ -1,16 +1,19 @@
 #!/bin/zsh
-# Builds SongNotifier.app (binary + icon), signs it ad-hoc, and (re)starts the login agent.
+# Builds SongNotifier.app (binary + icon), signs it ad-hoc, installs it to ~/Applications and (re)starts it.
 set -euo pipefail
 cd "${0:A:h}"
 
-# Installed in ~/Applications: macOS leaves the notification icon blank for apps in arbitrary folders.
+# Installed in ~/Applications so macOS accepts it as a login item ("Launch at login" in the app).
 APP=~/Applications/SongNotifier.app
-AGENT=com.quan.song-notifier
-PLIST=~/Library/LaunchAgents/$AGENT.plist
+OLD_AGENT=com.quan.song-notifier  # pre-0.2.0 launchd agent, replaced by the in-app "Launch at login"
+OLD_PLIST=~/Library/LaunchAgents/$OLD_AGENT.plist
 
 command -v media-control >/dev/null || {
   echo "media-control missing: brew tap ungive/media-control && brew install media-control" >&2; exit 1; }
 
+launchctl bootout gui/$(id -u) $OLD_PLIST 2>/dev/null || true
+rm -f $OLD_PLIST
+pkill -x song-notifier 2>/dev/null || true
 rm -rf $APP
 mkdir -p $APP/Contents/MacOS $APP/Contents/Resources
 cp Info.plist $APP/Contents/Info.plist
@@ -42,9 +45,6 @@ codesign --force --deep -s - $APP
 # re-register the rebuilt bundle, otherwise the notification popup can show a blank icon
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f $APP
 
-# login agent: point it at the installed app and (re)start it
-sed "s#__APP_BINARY__#$APP/Contents/MacOS/song-notifier#" $AGENT.plist > $PLIST
-launchctl bootout gui/$(id -u) $PLIST 2>/dev/null || true
-launchctl bootstrap gui/$(id -u) $PLIST
 killall usernoted NotificationCenter 2>/dev/null || true
+open $APP
 echo "Built and started $APP"
