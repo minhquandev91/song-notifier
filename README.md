@@ -21,8 +21,9 @@ in **any browser** (Edge, Chrome, Safari… e.g. YouTube, YouTube Music, Spotify
   this on macOS 15.4+; `media-control` works around it.
 - Waits ~1 s after a change so late-arriving artist/album metadata lands in the same popup,
   and notifies once per track title (pause/resume does not re-notify).
-- Shows the song rolling through the menu bar (♫ item). Click it for **⏮ ⏯ ⏭** icon buttons
-  (works for any player), a quick **Show popups** switch, **Settings…** and **Quit**.
+- Shows the song rolling through the menu bar (♫ item). Click it for a now-playing card: the player's artwork on
+  the left; title, artist and **⏮ ⏯ ⏭** icon buttons on the right (works for any player). Below it: a quick
+  **Show popups** switch, **Settings…** and **Quit**.
 - Click a popup to jump to the player: the app comes to the front, and in Edge/Chrome/Brave/Vivaldi/Safari
   the tab playing the song is selected (macOS asks once to allow controlling the browser).
 - Runs as a background app (`LSUIElement`, no Dock icon).

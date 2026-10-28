@@ -70,6 +70,37 @@ func focusPlayer(bundleID: String?, pid: Int32?, title: String?) {
     app?.activate()
 }
 
+// MARK: - Artwork
+
+// Rounded square showing the player's artwork (cropped to fill), or a music-note placeholder.
+final class ArtworkView: NSView {
+    let placeholder = NSImageView(image: NSImage(systemSymbolName: "music.note", accessibilityDescription: nil) ?? NSImage())
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.cornerRadius = 10
+        layer?.masksToBounds = true
+        layer?.contentsGravity = .resizeAspectFill
+        layer?.backgroundColor = NSColor.gray.withAlphaComponent(0.2).cgColor
+        placeholder.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 34, weight: .regular)
+        placeholder.contentTintColor = .secondaryLabelColor
+        placeholder.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(placeholder)
+        NSLayoutConstraint.activate([
+            placeholder.centerXAnchor.constraint(equalTo: centerXAnchor),
+            placeholder.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    func show(_ image: NSImage?) {
+        let cg = image?.cgImage(forProposedRect: nil, context: nil, hints: nil)
+        layer?.contents = cg
+        placeholder.isHidden = cg != nil
+    }
+}
+
 // MARK: - App
 
 final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
@@ -85,8 +116,10 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
 
     // menu bar
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-    let songMenuItem = NSMenuItem(title: "Not playing", action: nil, keyEquivalent: "")
     var playPauseButton: NSButton?
+    let artworkView = ArtworkView(frame: .zero)
+    let titleLabel = NSTextField(wrappingLabelWithString: "Not playing")
+    let artistLabel = NSTextField(labelWithString: "")
     let popupsMenuItem = NSMenuItem(title: "Show popups", action: #selector(togglePopupsFromMenu), keyEquivalent: "")
     let menuBarChars = 28  // fixed width in a monospaced font so the rolling text doesn't jiggle the bar
     var scrollOffset = 0
@@ -112,12 +145,9 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
         }
 
         let menu = NSMenu()
-        songMenuItem.isEnabled = false
-        menu.addItem(songMenuItem)
-        menu.addItem(.separator())
-        let controls = NSMenuItem()
-        controls.view = makeControls()
-        menu.addItem(controls)
+        let card = NSMenuItem()
+        card.view = makeCard()
+        menu.addItem(card)
         menu.addItem(.separator())
         popupsMenuItem.target = self
         popupsMenuItem.state = Flag.showPopups.isOn ? .on : .off
@@ -215,14 +245,25 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
     func handle(line: String) {
         guard let obj = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any],
               let payload = obj["payload"] as? [String: Any] else { return }
+        let titleBefore = state["title"] as? String
         if (obj["diff"] as? Bool) == true {
             for (k, v) in payload { if v is NSNull { state[k] = nil } else { state[k] = v } }
         } else {
             state = payload
         }
+        updateArtwork(payload: payload, isDiff: (obj["diff"] as? Bool) == true, titleChanged: titleBefore != state["title"] as? String)
         scrollOffset = 0
         refreshMenuBar()
         scheduleNotify()
+    }
+
+    // artworkData is a base64 image. A diff without it keeps the old artwork unless the track changed.
+    func updateArtwork(payload: [String: Any], isDiff: Bool, titleChanged: Bool) {
+        if let b64 = payload["artworkData"] as? String {
+            artworkView.show(Data(base64Encoded: b64).flatMap { NSImage(data: $0) })
+        } else if !isDiff || payload["artworkData"] is NSNull || titleChanged {
+            artworkView.show(nil)
+        }
     }
 
     // Browsers publish the title first and artist/album a moment later (sometimes a second title tweak too).
@@ -253,36 +294,59 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
         try? p.run()
     }
 
-    // ⏮ ⏯ ⏭ as icon buttons in one row, centred in the menu; clicking doesn't close the menu so the
-    // play/pause icon can be seen flipping.
-    func makeControls() -> NSView {
+    // Now-playing card at the top of the menu: artwork on the left; title, artist and the ⏮ ⏯ ⏭ icon
+    // buttons stacked on the right. Clicking a button doesn't close the menu, so the play/pause icon
+    // can be seen flipping. Menu item views get a fixed frame, hence the fixed sizes.
+    func makeCard() -> NSView {
+        let textWidth: CGFloat = 220, art: CGFloat = 96, pad: CGFloat = 16
+
         func button(_ symbol: String, _ tip: String, _ action: Selector) -> NSButton {
             let b = NSButton(image: NSImage(systemSymbolName: symbol, accessibilityDescription: tip) ?? NSImage(),
                              target: self, action: action)
             b.isBordered = false
-            b.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 18, weight: .regular)
+            b.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 22, weight: .regular)
             b.contentTintColor = .labelColor
             b.toolTip = tip
-            b.widthAnchor.constraint(equalToConstant: 40).isActive = true
-            b.heightAnchor.constraint(equalToConstant: 30).isActive = true
+            b.heightAnchor.constraint(equalToConstant: 34).isActive = true
             return b
         }
-        let previous = button("backward.fill", "Previous", #selector(previousTrack))
         let playPause = button("play.fill", "Play / Pause", #selector(togglePlayPause))
-        let next = button("forward.fill", "Next", #selector(nextTrack))
         playPauseButton = playPause
+        let controls = NSStackView(views: [button("backward.fill", "Previous", #selector(previousTrack)),
+                                           playPause,
+                                           button("forward.fill", "Next", #selector(nextTrack))])
+        controls.orientation = .horizontal
+        controls.alignment = .centerY
+        controls.distribution = .fillEqually
 
-        let row = NSStackView(views: [previous, playPause, next])
-        row.orientation = .horizontal
-        row.alignment = .centerY
-        row.spacing = 20
-        row.translatesAutoresizingMaskIntoConstraints = false
+        titleLabel.font = .systemFont(ofSize: 15, weight: .semibold)
+        titleLabel.maximumNumberOfLines = 2
+        titleLabel.lineBreakMode = .byTruncatingTail
+        artistLabel.font = .systemFont(ofSize: 12)
+        artistLabel.textColor = .secondaryLabelColor
+        artistLabel.lineBreakMode = .byTruncatingTail
 
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 38))
-        container.addSubview(row)
+        let column = NSStackView(views: [titleLabel, artistLabel, controls])
+        column.orientation = .vertical
+        column.alignment = .leading
+        column.spacing = 3
+        column.setCustomSpacing(8, after: artistLabel)
+        column.translatesAutoresizingMaskIntoConstraints = false
+        for v in [titleLabel, artistLabel, controls] { v.widthAnchor.constraint(equalToConstant: textWidth).isActive = true }
+        titleLabel.heightAnchor.constraint(equalToConstant: 38).isActive = true  // room for two lines, top-aligned
+
+        artworkView.translatesAutoresizingMaskIntoConstraints = false
+        let height = art + 2 * pad
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: pad + art + 14 + textWidth + pad, height: height))
+        container.addSubview(artworkView)
+        container.addSubview(column)
         NSLayoutConstraint.activate([
-            row.centerXAnchor.constraint(equalTo: container.centerXAnchor),
-            row.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            artworkView.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: pad),
+            artworkView.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            artworkView.widthAnchor.constraint(equalToConstant: art),
+            artworkView.heightAnchor.constraint(equalToConstant: art),
+            column.leadingAnchor.constraint(equalTo: artworkView.trailingAnchor, constant: 14),
+            column.centerYAnchor.constraint(equalTo: container.centerYAnchor),
         ])
         return container
     }
@@ -296,7 +360,11 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
     func refreshMenuBar() {
         statusItem.isVisible = Flag.showInMenuBar.isOn
         let line = songLine
-        songMenuItem.title = line.isEmpty ? "Not playing" : line
+        let title = state["title"] as? String ?? ""
+        let artist = state["artist"] as? String ?? ""
+        let shownTitle = title.isEmpty ? "Not playing" : title
+        if titleLabel.stringValue != shownTitle { titleLabel.stringValue = shownTitle }
+        if artistLabel.stringValue != artist { artistLabel.stringValue = artist }
         let symbol = isPlaying ? "pause.fill" : "play.fill"
         playPauseButton?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Play / Pause")
         guard statusItem.isVisible, let button = statusItem.button else { return }
