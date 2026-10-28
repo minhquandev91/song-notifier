@@ -33,7 +33,8 @@ in **any browser** (Edge, Chrome, Safari… e.g. YouTube, YouTube Music, Spotify
 
 Open from the menu bar item (or by opening Song Notifier again if the item is hidden):
 **Launch at login** (a regular macOS login item, listed in System Settings → General → Login Items),
-**show the song in the menu bar**, **roll long titles**, and **show popups**
+**show the song in the menu bar**, **roll long titles**, the **menu bar size** (1x, 0.8x or 0.5x width),
+and **show popups**
 (turn popups off to keep just the menu bar title).
 
 ## Install

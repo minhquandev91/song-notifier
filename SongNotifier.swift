@@ -215,7 +215,14 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
     let titleLabel = NSTextField(wrappingLabelWithString: "Not playing")
     let artistLabel = NSTextField(labelWithString: "")
     let popupsMenuItem = NSMenuItem(title: "Show popups", action: #selector(togglePopupsFromMenu), keyEquivalent: "")
-    let menuBarChars = 28  // fixed width in a monospaced font so the rolling text doesn't jiggle the bar
+    // Banner width = 28 characters of a monospaced font (so the rolling text doesn't jiggle the bar) times
+    // the size chosen in Settings.
+    static let sizes: [(label: String, scale: Double)] = [("1x", 1.0), ("0.8x", 0.8), ("0.5x", 0.5)]
+    var menuBarScale: Double {
+        let v = UserDefaults.standard.double(forKey: "menuBarScale")
+        return Controller.sizes.contains { $0.scale == v } ? v : 1.0
+    }
+    var menuBarChars: Int { Int((28 * menuBarScale).rounded()) }
     var scrollOffset = 0
     var ticker: Timer?
 
@@ -225,6 +232,7 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
     var loginNote: NSTextField?
     var popupsBox: NSButton?
     var settingsStack: NSStackView?
+    var sizeControl: NSSegmentedControl?
 
     var isPlaying: Bool { (state["playing"] as? Bool) == true }
     var songLine: String {
@@ -547,7 +555,20 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
         copyright.font = .systemFont(ofSize: 11)
         copyright.textColor = .tertiaryLabelColor
 
-        let stack = NSStackView(views: [login, note, menubar, scroll, popups, hint, copyright])
+        // menu bar size presets, indented to line up with the checkbox titles above
+        let sizeTitle = NSTextField(labelWithString: "Menu bar size")
+        let size = NSSegmentedControl(labels: Controller.sizes.map { $0.label }, trackingMode: .selectOne,
+                                      target: self, action: #selector(sizeChanged(_:)))
+        size.selectedSegment = Controller.sizes.firstIndex { $0.scale == menuBarScale } ?? 0
+        size.isEnabled = Flag.showInMenuBar.isOn
+        sizeControl = size
+        let widthRow = NSStackView(views: [sizeTitle, size])
+        widthRow.orientation = .horizontal
+        widthRow.alignment = .centerY
+        widthRow.spacing = 12
+        widthRow.edgeInsets = NSEdgeInsets(top: 0, left: 21, bottom: 0, right: 0)
+
+        let stack = NSStackView(views: [login, note, menubar, scroll, widthRow, popups, hint, copyright])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 10
@@ -645,7 +666,16 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
         syncLoginBox()
         if SMAppService.mainApp.status == .requiresApproval { SMAppService.openSystemSettingsLoginItems() }
     }
-    @objc func toggleMenuBar(_ s: NSButton) { Flag.showInMenuBar.set(s.state == .on); refreshMenuBar() }
+    @objc func toggleMenuBar(_ s: NSButton) {
+        Flag.showInMenuBar.set(s.state == .on)
+        sizeControl?.isEnabled = s.state == .on
+        refreshMenuBar()
+    }
+    @objc func sizeChanged(_ c: NSSegmentedControl) {
+        UserDefaults.standard.set(Controller.sizes[c.selectedSegment].scale, forKey: "menuBarScale")
+        scrollOffset = 0
+        refreshMenuBar()
+    }
     @objc func toggleScroll(_ s: NSButton) { Flag.scrollTitle.set(s.state == .on); scrollOffset = 0; refreshMenuBar() }
     @objc func togglePopups(_ s: NSButton) { setPopups(s.state == .on) }
     @objc func togglePopupsFromMenu() { setPopups(!Flag.showPopups.isOn) }
