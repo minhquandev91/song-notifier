@@ -34,8 +34,28 @@ Open from the menu bar item (or by opening Song Notifier again if the item is hi
 
 ## Install
 
+### Homebrew (easiest)
+
 ```sh
-brew tap ungive/media-control && brew install media-control
+brew install --cask minhquandev91/tap/song-notifier
+```
+
+This also installs [`media-control`](https://github.com/ungive/media-control), which the app needs to read what is playing.
+Then open **Song Notifier** and tick **Launch at login** if you want it at startup.
+
+### Manual download
+
+1. `brew tap ungive/media-control && brew install media-control`
+2. Download `SongNotifier-<version>.zip` from the [latest release](https://github.com/minhquandev91/song-notifier/releases/latest),
+   unzip it and move **SongNotifier.app** to `/Applications` (or `~/Applications`).
+3. The app is signed ad-hoc (not notarized), so macOS blocks the first launch: right-click the app → **Open** → **Open**,
+   or run `xattr -dr com.apple.quarantine /Applications/SongNotifier.app`.
+
+Requires macOS 13+ on Apple Silicon (tested on macOS 27).
+
+## Build from source
+
+```sh
 ./build.sh
 ```
 
@@ -50,6 +70,8 @@ Drop any square-ish picture at `tools/icon-source.jpg` (or `.png`) and run `./bu
 it is cropped to a full-bleed square with a ♫ badge (macOS applies the rounded mask). Without it, the code-drawn icon is used.
 The picture is git-ignored, so third-party artwork stays out of the repo.
 
+`./package.sh` builds a shareable `dist/SongNotifier-<version>.zip` (always with the code-drawn icon, never your custom picture).
+
 ## Manage
 
 Quit from the menu bar item. Uninstall: untick **Launch at login**, quit, then delete
@@ -63,6 +85,7 @@ Quit from the menu bar item. Uninstall: untick **Launch at login**, quit, then d
 | `Info.plist` | App bundle metadata (bundle id, background-only, icon) |
 | `tools/make-icon.swift` | Draws the default icon in code: a nervous pink-haired guitarist girl with headphones |
 | `tools/make-icon-from-image.swift` | Turns any picture into an icon (full-bleed square crop + music-note badge) |
+| `package.sh` | Runs `build.sh`, then zips the app to `dist/` for sharing |
 | `build.sh` | Build + install + (re)start (and remove the old launchd agent) |
 
 ## Troubleshooting
@@ -72,3 +95,7 @@ Quit from the menu bar item. Uninstall: untick **Launch at login**, quit, then d
 - **Blank icon in the popup:** macOS caches the notification icon per bundle id, including a blank
   one from a build that had no icon yet. Bump `CFBundleIdentifier` in `Info.plist` and rebuild.
 - **Stopped working after a brew cleanup:** `media-control` must be at `/opt/homebrew/bin/media-control`.
+
+## License
+
+[MIT](LICENSE): free to use, modify and distribute.
