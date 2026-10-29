@@ -6,8 +6,12 @@ import UserNotifications
 // optionally with the song rolling through the menu bar. Clicking a popup focuses the player.
 
 // A second copy (e.g. started by hand) would double every popup; the running one wins.
+// The QA entry points (--snapshot, --history-test) must run alongside the app, so they opt out.
 let snapshotMode = CommandLine.arguments.contains("--snapshot")
-if !snapshotMode, let id = Bundle.main.bundleIdentifier,
+let historyTestMode = CommandLine.arguments.contains("--history-test")
+let focusTestMode = CommandLine.arguments.contains("--focus-test")
+// The QA entry points have to run alongside the app, so they opt out of the single-instance guard.
+if !snapshotMode, !historyTestMode, !focusTestMode, let id = Bundle.main.bundleIdentifier,
    NSRunningApplication.runningApplications(withBundleIdentifier: id).contains(where: { $0.processIdentifier != getpid() }) {
     exit(0)
 }
@@ -15,7 +19,7 @@ if !snapshotMode, let id = Bundle.main.bundleIdentifier,
 // MARK: - Settings (UserDefaults; every flag defaults to on)
 
 enum Flag: String {
-    case showPopups, showInMenuBar, scrollTitle
+    case showPopups, showInMenuBar, scrollTitle, recentList
     var isOn: Bool { UserDefaults.standard.object(forKey: rawValue) as? Bool ?? true }
     func set(_ on: Bool) { UserDefaults.standard.set(on, forKey: rawValue) }
 }
@@ -58,17 +62,61 @@ let browserKinds = [
     "com.brave.Browser": "chromium", "com.vivaldi.Vivaldi": "chromium", "com.apple.Safari": "safari",
 ]
 
-func focusPlayer(bundleID: String?, pid: Int32?, title: String?) {
-    guard let bundleID else { return }
+// The link of a song is not in media-control's data, but while the song plays it is the URL of the browser
+// tab playing it — so it is read from the tab once per track and kept with the history row.
+let tabURLScripts = [
+    "chromium": """
+        tell application id "%@"
+          repeat with w in windows
+            repeat with t in tabs of w
+              if title of t contains "%@" then return URL of t
+            end repeat
+          end repeat
+        end tell
+        """,
+    "safari": """
+        tell application id "%@"
+          repeat with w in windows
+            repeat with t in tabs of w
+              if name of t contains "%@" then return URL of t
+            end repeat
+          end repeat
+        end tell
+        """,
+]
+
+// Inside the AppleScript string literals above, backslashes and quotes have to be escaped.
+func scriptEscaped(_ s: String) -> String {
+    s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+}
+
+// Link of the browser tab playing `title`, or nil when no tab matches (or the player is not a browser).
+func playingURL(bundleID: String?, title: String) -> String? {
+    guard let bundleID, let kind = browserKinds[bundleID], !title.isEmpty else { return nil }
+    var err: NSDictionary?
+    let url = NSAppleScript(source: String(format: tabURLScripts[kind]!, bundleID, scriptEscaped(title)))?
+        .executeAndReturnError(&err).stringValue
+    if let err { print("tab link lookup failed:", err) }
+    return (url?.hasPrefix("http") ?? false) ? url : nil
+}
+
+// Brings the player to the front, and for browsers also selects the tab playing that song.
+// Returns true when a browser tab was actually selected (used by --focus-test; the other callers ignore it).
+@discardableResult
+func focusPlayer(bundleID: String?, pid: Int32?, title: String?) -> Bool {
+    guard let bundleID else { return false }
+    var selectedTab = false
     if let kind = browserKinds[bundleID], let title, !title.isEmpty {
-        let escaped = title.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
         var err: NSDictionary?
-        NSAppleScript(source: String(format: tabScripts[kind]!, bundleID, escaped))?.executeAndReturnError(&err)
+        let result = NSAppleScript(source: String(format: tabScripts[kind]!, bundleID, scriptEscaped(title)))?
+            .executeAndReturnError(&err)
+        selectedTab = result?.booleanValue ?? false
         if let err { print("tab focus failed:", err) }
     }
     let app = pid.flatMap { NSRunningApplication(processIdentifier: $0) }
         ?? NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first
     app?.activate()
+    return selectedTab
 }
 
 // MARK: - Artwork
@@ -105,6 +153,94 @@ final class ArtworkView: NSView {
         let cg = image?.cgImage(forProposedRect: nil, context: nil, hints: nil)
         layer?.contents = cg
         placeholder.isHidden = cg != nil
+    }
+}
+
+// MARK: - Recently played
+
+// One row of the Recently Played list. Small and Codable so the whole list fits in UserDefaults as JSON.
+// The link and the player's ids are kept so clicking a row can go back to that song later.
+struct Track: Codable {
+    var title: String
+    var artist: String
+    var url: String?
+    var bundleID: String?
+    var pid: Int32?
+    var plays: Int
+
+    var line: String {
+        let base = artist.isEmpty ? title : "\(title) — \(artist)"
+        return plays > 1 ? "\(base)  ×\(plays)" : base
+    }
+}
+
+// Newest first, de-duplicated by title+artist: hearing a song again moves it back to the top and counts a play.
+// Bounded so the store never grows (25 kept, 10 shown); no artwork — thumbnails would bloat UserDefaults.
+enum History {
+    static let kept = 25, shown = 10
+    private static let key = "recentlyPlayed"
+    // swapped by --history-test so the check never touches the real list
+    static var store = UserDefaults.standard
+
+    private(set) static var tracks: [Track] = load()
+
+    static func load() -> [Track] {
+        guard let data = store.data(forKey: key),
+              let list = try? JSONDecoder().decode([Track].self, from: data) else { return [] }
+        return list
+    }
+
+    static func save() { store.set(try? JSONEncoder().encode(tracks), forKey: key) }
+
+    // re-reads the current store (used after the snapshot swaps it for a throwaway suite and back)
+    static func reload() { tracks = load() }
+
+    static func add(title: String, artist: String, url: String?, bundleID: String?, pid: Int32?) {
+        guard !title.isEmpty else { return }
+        if let i = tracks.firstIndex(where: { $0.title == title && $0.artist == artist }) {
+            var t = tracks.remove(at: i)
+            t.plays += 1
+            t.url = url ?? t.url  // a play that could not resolve a link keeps the one already stored
+            t.bundleID = bundleID
+            t.pid = pid
+            tracks.insert(t, at: 0)
+        } else {
+            tracks.insert(Track(title: title, artist: artist, url: url, bundleID: bundleID, pid: pid, plays: 1), at: 0)
+        }
+        tracks = Array(tracks.prefix(kept))
+        save()
+    }
+
+    static func clear() {
+        tracks = []
+        save()
+    }
+
+    // Throwaway defaults suite the checks run against, so they never touch the real list.
+    static let testSuite = "com.quan.songnotifier.history-test"
+
+    // Exercises the store the menu reads: `<app>/Contents/MacOS/song-notifier --history-test`
+    static func selfTest() {
+        func check(_ ok: Bool, _ what: String) { print("\(ok ? "ok  " : "FAIL")  \(what)") }
+        let name = testSuite
+        store = UserDefaults(suiteName: name)!
+        store.removePersistentDomain(forName: name)
+        tracks = []
+        add(title: "A", artist: "X", url: "https://example.com/a", bundleID: "b", pid: 1)
+        add(title: "B", artist: "Y", url: nil, bundleID: "b", pid: 1)
+        add(title: "A", artist: "X", url: nil, bundleID: "b", pid: 1)
+        check(tracks.count == 2, "playing 2 songs (one twice) gives 2 rows")
+        check(tracks.first?.title == "A" && tracks.first?.plays == 2, "a repeat moves to the top and counts a play")
+        check(tracks.first?.url == "https://example.com/a", "a repeat with no link keeps the stored one")
+        check(load().count == tracks.count, "survives a reload (persisted)")
+        check(load().first?.url == "https://example.com/a", "the stored link survives a reload")
+        for i in 0..<40 { add(title: "S\(i)", artist: "", url: nil, bundleID: nil, pid: nil) }
+        check(tracks.count == kept, "capped at \(kept) rows")
+        check(tracks.first?.title == "S39", "newest first")
+        clear()
+        check(tracks.isEmpty && load().isEmpty, "clear empties the list")
+        store.removePersistentDomain(forName: name)
+        store = UserDefaults.standard
     }
 }
 
@@ -196,7 +332,7 @@ final class WaveView: NSView {
 
 // MARK: - App
 
-final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
     let un = UNUserNotificationCenter.current()
 
     // Now Playing state is fed by `media-control stream` (brew install ungive/media-control/media-control),
@@ -209,12 +345,16 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
 
     // menu bar
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    var statusMenu = NSMenu()
     var playPauseButton: NSButton?
     let artworkView = ArtworkView(frame: .zero)
     let waveView = WaveView(frame: .zero)
     let titleLabel = NSTextField(wrappingLabelWithString: "Not playing")
     let artistLabel = NSTextField(labelWithString: "")
     let popupsMenuItem = NSMenuItem(title: "Show popups", action: #selector(togglePopupsFromMenu), keyEquivalent: "")
+    // Recently Played: the rows are rebuilt in menuWillOpen, so the menu never changes while it is closed.
+    let recentMenuItem = NSMenuItem(title: "Recently Played", action: nil, keyEquivalent: "")
+    let recentMenu = NSMenu()
     // Banner width = 28 characters of a monospaced font (so the rolling text doesn't jiggle the bar) times
     // the size chosen in Settings.
     static let sizes: [(label: String, scale: Double)] = [("1x", 1.0), ("0.8x", 0.8), ("0.5x", 0.5)]
@@ -246,22 +386,22 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
             snapshot(into: CommandLine.arguments[i + 1])  // layout QA: `song-notifier --snapshot <dir>`
             exit(0)
         }
+        if historyTestMode {
+            History.selfTest()  // store QA: `song-notifier --history-test`
+            recordTest()        // detection QA: stream lines in, list rows out
+            exit(0)
+        }
+        if focusTestMode {
+            focusTest()         // navigation QA: is the browser tab playing the song found?
+            exit(0)
+        }
         un.delegate = self
         un.requestAuthorization(options: [.alert]) { granted, err in
             print("notification permission granted:", granted, err?.localizedDescription ?? "")
         }
 
-        let menu = NSMenu()
-        let card = NSMenuItem()
-        card.view = makeCard()
-        menu.addItem(card)
-        menu.addItem(.separator())
-        popupsMenuItem.target = self
-        popupsMenuItem.state = Flag.showPopups.isOn ? .on : .off
-        menu.addItem(popupsMenuItem)
-        menu.addItem(withTitle: "Settings…", action: #selector(showSettings), keyEquivalent: ",").target = self
-        menu.addItem(withTitle: "Quit Song Notifier", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        statusItem.menu = menu
+        statusMenu = makeStatusMenu()
+        statusItem.menu = statusMenu
         statusItem.button?.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
         ticker = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { [weak self] _ in
             self?.scrollOffset += 1
@@ -381,12 +521,20 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
         let work = DispatchWorkItem { [self] in
             guard isPlaying, let name = state["title"] as? String, !name.isEmpty, name != lastTrack else { return }
             lastTrack = name
-            guard Flag.showPopups.isOn else { return }
             let artist = state["artist"] as? String ?? ""
             let album = state["album"] as? String ?? ""
+            let bundleID = state["bundleIdentifier"] as? String
+            let pid = state["processIdentifier"] as? Int32
+            // the history is not a notification, so it is recorded even with popups switched off.
+            // The link is read here, while that song is still the one in the tab.
+            if Flag.recentList.isOn {
+                History.add(title: name, artist: artist, url: playingURL(bundleID: bundleID, title: name),
+                            bundleID: bundleID, pid: pid)
+            }
+            guard Flag.showPopups.isOn else { return }
             var player: [String: Any] = ["title": name]
-            player["bundleID"] = state["bundleIdentifier"] as? String
-            player["pid"] = state["processIdentifier"] as? Int32
+            player["bundleID"] = bundleID
+            player["pid"] = pid
             notify(title: name, body: [artist, album].filter { !$0.isEmpty }.joined(separator: " — "), player: player)
         }
         pending = work
@@ -487,8 +635,74 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
 
     // MARK: menu bar
 
+    // The whole status menu. Called once at launch (and once by --snapshot): it hands the stored menu items
+    // to the menu, and an NSMenuItem can only live in one menu, so a second call raises from addItem.
+    func makeStatusMenu() -> NSMenu {
+        let menu = NSMenu()
+        let card = NSMenuItem()
+        card.view = makeCard()
+        menu.addItem(card)
+        menu.addItem(.separator())
+        popupsMenuItem.target = self
+        popupsMenuItem.state = Flag.showPopups.isOn ? .on : .off
+        menu.addItem(popupsMenuItem)
+        recentMenuItem.submenu = recentMenu
+        recentMenu.delegate = self
+        menu.addItem(recentMenuItem)
+        menu.addItem(withTitle: "Settings…", action: #selector(showSettings), keyEquivalent: ",").target = self
+        menu.addItem(withTitle: "Quit Song Notifier", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        return menu
+    }
+
+    // Rebuilt on every open: the rows always match History, without touching the menu while it is closed.
+    func menuWillOpen(_ menu: NSMenu) {
+        guard menu === recentMenu else { return }
+        recentMenu.removeAllItems()
+        let recent = Array(History.tracks.prefix(History.shown))
+        if recent.isEmpty {
+            let empty = NSMenuItem(title: "Nothing played yet", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            recentMenu.addItem(empty)
+        }
+        for t in recent {
+            let item = NSMenuItem(title: t.line, action: #selector(openRecent(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = t
+            item.toolTip = "Open the player"
+            recentMenu.addItem(item)
+        }
+        recentMenu.addItem(.separator())
+        let clear = NSMenuItem(title: "Clear Recently Played", action: #selector(clearRecent), keyEquivalent: "")
+        clear.target = self
+        clear.isEnabled = !recent.isEmpty
+        recentMenu.addItem(clear)
+    }
+
+    // Clicking a row goes back to that song: the tab is selected if it is still open, otherwise the link
+    // stored with the row is opened in the player's browser. Returns true when the song was reached.
+    @discardableResult
+    @objc func openRecent(_ item: NSMenuItem) -> Bool {
+        guard let t = item.representedObject as? Track else { return false }
+        if focusPlayer(bundleID: t.bundleID, pid: t.pid, title: t.title) { return true }
+        guard let url = t.url, let target = URL(string: url) else { return false }
+        return openInPlayer(target, bundleID: t.bundleID)
+    }
+
+    // Opens a link in the browser that played the song, or in the default browser when it is not running.
+    func openInPlayer(_ target: URL, bundleID: String?) -> Bool {
+        guard let bundleID,
+              let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first,
+              let appURL = app.bundleURL else { return NSWorkspace.shared.open(target) }
+        app.activate()
+        NSWorkspace.shared.open([target], withApplicationAt: appURL, configuration: NSWorkspace.OpenConfiguration()) { _, _ in }
+        return true
+    }
+
+    @objc func clearRecent() { History.clear() }
+
     func refreshMenuBar() {
         statusItem.isVisible = Flag.showInMenuBar.isOn
+        recentMenuItem.isHidden = !Flag.recentList.isOn
         let line = songLine
         let title = state["title"] as? String ?? ""
         let artist = state["artist"] as? String ?? ""
@@ -535,9 +749,11 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
         let menubar = checkbox("Show the song in the menu bar", #selector(toggleMenuBar(_:)))
         let scroll = checkbox("Roll long titles across the menu bar", #selector(toggleScroll(_:)))
         let popups = checkbox("Show a popup when the song changes", #selector(togglePopups(_:)))
+        let recent = checkbox("Keep a list of recently played songs", #selector(toggleRecent(_:)))
         menubar.state = Flag.showInMenuBar.isOn ? .on : .off
         scroll.state = Flag.scrollTitle.isOn ? .on : .off
         popups.state = Flag.showPopups.isOn ? .on : .off
+        recent.state = Flag.recentList.isOn ? .on : .off
         popupsBox = popups
         loginBox = login
 
@@ -568,7 +784,7 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
         widthRow.spacing = 12
         widthRow.edgeInsets = NSEdgeInsets(top: 0, left: 21, bottom: 0, right: 0)
 
-        let stack = NSStackView(views: [login, note, menubar, scroll, widthRow, popups, hint, copyright])
+        let stack = NSStackView(views: [login, note, menubar, scroll, widthRow, popups, recent, hint, copyright])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 10
@@ -600,9 +816,142 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
         window = w
     }
 
+    // What macOS reports as now playing right now (`media-control get`), or nil when nothing is.
+    func nowPlaying() -> [String: Any]? {
+        guard let tool = mediaControlURL else { print("bundled media-control not found"); return nil }
+        let p = Process()
+        p.executableURL = tool
+        p.arguments = ["get"]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        try? p.run()
+        p.waitUntilExit()
+        return (try? JSONSerialization.jsonObject(with: pipe.fileHandleForReading.readDataToEndOfFile())) as? [String: Any]
+    }
+
+    // Drives the real detection path with synthetic stream lines (JSON in -> list row out), so the whole
+    // chain is checked without playing music. Run by --history-test, after History.selfTest().
+    func recordTest() {
+        func check(_ ok: Bool, _ what: String) { print("\(ok ? "ok  " : "FAIL")  \(what)") }
+        let name = History.testSuite + ".record"
+        History.store = UserDefaults(suiteName: name)!
+        History.store.removePersistentDomain(forName: name)
+        History.clear()
+        let popups = Flag.showPopups.isOn
+        Flag.showPopups.set(false)  // the check must not fire real notification banners
+        for (n, title) in ["Test Song A", "Test Song B"].enumerated() {
+            // real stream lines, exactly as media-control writes them
+            handle(line: #"{"diff":false,"payload":{"playing":true,"title":"\#(title)","artist":"Test Artist","bundleIdentifier":"com.spotify.client","processIdentifier":\#(1000 + n)}}"#)
+            RunLoop.current.run(until: Date().addingTimeInterval(1.3))  // the app waits 1 s for late metadata
+        }
+        check(History.tracks.count == 2, "two song changes recorded 2 rows (got \(History.tracks.count))")
+        check(History.tracks.first?.title == "Test Song B", "newest row is the song that played last")
+        // A non-browser player has no tab to read a link from, so the row must still be recorded without one.
+        check(History.tracks.first?.url == nil, "a non-browser row is recorded with no link")
+        // And with a browser: the song playing right now is written through the same path, link and all.
+        if let live = nowPlaying(), let liveTitle = live["title"] as? String, !liveTitle.isEmpty {
+            let liveArtist = live["artist"] as? String ?? ""
+            let liveBundle = live["bundleIdentifier"] as? String ?? ""
+            let line = #"{"diff":false,"payload":{"playing":true,"title":"\#(liveTitle)","artist":"\#(liveArtist)","bundleIdentifier":"\#(liveBundle)","processIdentifier":1}}"#
+            handle(line: line)
+            RunLoop.current.run(until: Date().addingTimeInterval(1.3))
+            let row = History.tracks.first
+            print("      live song:   \(liveTitle)  [\(liveBundle)]")
+            print("      stored link: \(row?.url ?? "none")")
+            check(row?.title == liveTitle, "the song playing now was recorded")
+        } else {
+            print("note  nothing is playing, so the live-link check was skipped")
+        }
+        Flag.showPopups.set(popups)
+        statusMenu = makeStatusMenu()
+        let dump = menuDump()
+        check(dump.contains("Test Song B — Test Artist"), "the menu shows the recorded song")
+        print(dump, terminator: "")
+        History.store.removePersistentDomain(forName: name)
+        History.store = UserDefaults.standard
+        History.reload()
+    }
+
+    // QA: bring up whatever is playing now and report whether the browser tab was found — the same thing
+    // clicking a row of Recently Played does. `song-notifier --focus-test ["<song title>"]`.
+    // `--focus-test --row N` instead clicks row N of the real Recently Played list, handler and all.
+    func focusTest() {
+        if let ri = CommandLine.arguments.firstIndex(of: "--row"), ri + 1 < CommandLine.arguments.count,
+           let n = Int(CommandLine.arguments[ri + 1]) {
+            statusMenu = makeStatusMenu()
+            menuWillOpen(recentMenu)  // fills in the rows, exactly as opening the menu does
+            let rows = recentMenu.items.filter { $0.representedObject is Track }
+            guard n >= 1, n <= rows.count else { print("row \(n) out of range (1...\(rows.count))"); return }
+            print("clicking row \(n) of \(rows.count): \(rows[n - 1].title)")
+            print("      link on the row: \(rows[n - 1].representedObject.flatMap { ($0 as? Track)?.url } ?? "none")")
+            let actioned = openRecent(rows[n - 1])  // what AppKit calls when the row is picked
+            // NSWorkspace.open is asynchronous and this process is short-lived: give the request time to
+            // reach the browser before exiting, or it is dropped (the app itself stays alive, so it never is).
+            RunLoop.current.run(until: Date().addingTimeInterval(2))
+            print(actioned ? "ok    the row was actioned (existing tab selected, or its stored link opened)"
+                           : "note  nothing to open: no tab and no stored link for that row")
+            return
+        }
+        // Both branches of a row click, on the song playing now: the stored link is opened with a title that
+        // cannot match a tab, so this lane is the link one (the --row lane above covers the tab one).
+        if CommandLine.arguments.contains("--open-url") {
+            guard let live = nowPlaying(), let liveTitle = live["title"] as? String, !liveTitle.isEmpty else {
+                print("nothing is playing, so there is no link to store"); return
+            }
+            let bundleID = live["bundleIdentifier"] as? String
+            guard let url = playingURL(bundleID: bundleID, title: liveTitle) else {
+                print("no link found for \"\(liveTitle)\" (is its tab still open?)"); return
+            }
+            let row = Track(title: "zz no tab matches this", artist: "", url: url, bundleID: bundleID, pid: nil, plays: 1)
+            let item = NSMenuItem(title: row.line, action: #selector(openRecent(_:)), keyEquivalent: "")
+            item.representedObject = row
+            print("row link: \(url)")
+            let actioned = openRecent(item)
+            RunLoop.current.run(until: Date().addingTimeInterval(2))
+            print(actioned ? "ok    the stored link was handed to the browser"
+                           : "FAIL  the stored link was not opened")
+            return
+        }
+        guard let now = nowPlaying() else { print("bundled media-control not found"); return }
+        var title: String?
+        if let i = CommandLine.arguments.firstIndex(of: "--focus-test"), i + 1 < CommandLine.arguments.count,
+           !CommandLine.arguments[i + 1].hasPrefix("--") {
+            title = CommandLine.arguments[i + 1]
+        }
+        let song = title ?? now["title"] as? String ?? ""
+        let bundleID = now["bundleIdentifier"] as? String
+        print("now playing: \(song.isEmpty ? "-" : song)  [\(bundleID ?? "-")]")
+        let found = focusPlayer(bundleID: bundleID, pid: now["processIdentifier"] as? Int32, title: song)
+        print(found ? "ok    the browser tab with that song was selected"
+                   : "note  no browser tab matched, only the app was activated")
+    }
+
     // MARK: layout QA
 
-    // Renders the menu card and the settings window with sample data, light and dark, to PNGs in `dir`.
+    // Menu rows are built by menuWillOpen, so a dump has to open them the same way the app does.
+    // Returns "" for the top level (the card is a view, not a title) and indents submenus.
+    func menuDump() -> String {
+        var lines: [String] = []
+        func walk(_ menu: NSMenu, _ indent: String) {
+            for item in menu.items {
+                if item.isSeparatorItem { lines.append(indent + "---"); continue }
+                if item.view != nil { lines.append(indent + "(now-playing card)"); continue }
+                var line = indent + item.title
+                if item.isHidden { line += "   (hidden)" }
+                if !item.isEnabled { line += "   (disabled)" }
+                lines.append(line)
+                if let sub = item.submenu {
+                    menuWillOpen(sub)
+                    walk(sub, indent + "    ")
+                }
+            }
+        }
+        walk(statusMenu, "")
+        return lines.isEmpty ? "(no items)\n" : lines.joined(separator: "\n") + "\n"
+    }
+
+    // Renders the menu card and the settings window with sample data, light and dark, to PNGs in `dir`,
+    // plus the menu structure (menu.txt) with sample history.
     func snapshot(into dir: String) {
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         func render(_ view: NSView, name: String) {
@@ -636,6 +985,27 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
         render(card, name: "card-idle")
         buildWindow()
         if let content = window?.contentView { render(content, name: "settings") }
+
+        // status menu structure, with sample history (in a throwaway suite) so the Recently Played rows show up.
+        // Built once on purpose: makeStatusMenu() hands its stored items to the menu, so calling it twice throws.
+        let scratch = "com.quan.song-notifier.menu-dump"
+        let suite = UserDefaults(suiteName: scratch)!
+        let flags = "showPopups=\(Flag.showPopups.isOn) showInMenuBar=\(Flag.showInMenuBar.isOn) "
+            + "recentList=\(Flag.recentList.isOn)\n"
+        History.store = suite
+        History.clear()
+        statusMenu = makeStatusMenu()
+        try? (flags + menuDump()).write(toFile: "\(dir)/menu-empty.txt", atomically: true, encoding: .utf8)
+        for _ in 0..<2 {
+            History.add(title: "BÊN ÁY EM CÓ AI RỒI - CHÂU KHẢI PHONG | CA SĨ GIẤU MẶT COVER", artist: "Beta Music",
+                        url: "https://www.youtube.com/watch?v=example", bundleID: "com.google.Chrome", pid: nil)
+        }
+        History.add(title: "ĐỔI TÊN", artist: "KAI Hâm Nhạc", url: nil, bundleID: "com.spotify.client", pid: nil)
+        // menuDump() opens the submenu the same way AppKit does, so this re-reads the history above
+        try? (flags + menuDump()).write(toFile: "\(dir)/menu.txt", atomically: true, encoding: .utf8)
+        suite.removePersistentDomain(forName: scratch)
+        History.store = UserDefaults.standard
+        History.reload()
     }
 
     func syncLoginBox() {
@@ -679,6 +1049,10 @@ final class Controller: NSObject, NSApplicationDelegate, UNUserNotificationCente
     @objc func toggleScroll(_ s: NSButton) { Flag.scrollTitle.set(s.state == .on); scrollOffset = 0; refreshMenuBar() }
     @objc func togglePopups(_ s: NSButton) { setPopups(s.state == .on) }
     @objc func togglePopupsFromMenu() { setPopups(!Flag.showPopups.isOn) }
+    @objc func toggleRecent(_ s: NSButton) {
+        Flag.recentList.set(s.state == .on)
+        refreshMenuBar()  // shows/hides the Recently Played submenu
+    }
 
     // one place keeps the menu item and the settings checkbox in step; popups off still keeps the menu bar title
     func setPopups(_ on: Bool) {

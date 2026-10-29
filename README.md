@@ -27,6 +27,11 @@ in **any browser** (Edge, Chrome, Safari… e.g. YouTube, YouTube Music, Spotify
   **Show popups** switch, **Settings…** and **Quit**.
 - Click a popup to jump to the player: the app comes to the front, and in Edge/Chrome/Brave/Vivaldi/Safari
   the tab playing the song is selected (macOS asks once to allow controlling the browser).
+- Keeps a **Recently Played** list in the menu: the last 10 songs, each with how many times it played.
+  The song's **link is stored with the row** (read from the browser tab while it plays), so picking a row goes
+  back to that song — the tab is selected if it is still open, and if it is not, the stored link is opened in
+  the same browser. **Clear Recently Played** empties the list; turn the whole thing off in Settings to keep
+  nothing.
 - Runs as a background app (`LSUIElement`, no Dock icon).
 
 ## Settings
@@ -34,8 +39,8 @@ in **any browser** (Edge, Chrome, Safari… e.g. YouTube, YouTube Music, Spotify
 Open from the menu bar item (or by opening Song Notifier again if the item is hidden):
 **Launch at login** (a regular macOS login item, listed in System Settings → General → Login Items),
 **show the song in the menu bar**, **roll long titles**, the **menu bar size** (1x, 0.8x or 0.5x width),
-and **show popups**
-(turn popups off to keep just the menu bar title).
+**show popups**
+(turn popups off to keep just the menu bar title), and **keep a list of recently played songs**.
 
 ## Install
 
@@ -73,7 +78,14 @@ if you want it at startup, and allow notifications from **Song Notifier** when m
 (or in System Settings → Notifications).
 
 UI layout check: `~/Applications/SongNotifier.app/Contents/MacOS/song-notifier --snapshot /tmp/ui` renders the
-menu card and settings window (light and dark) to PNGs without showing anything on screen.
+menu card and settings window (light and dark) to PNGs without showing anything on screen, and writes the menu
+structure to `menu.txt` / `menu-empty.txt`. `--history-test` checks the list end to end — de-duplication,
+play counts, stored links, cap, persistence and clear (against a throwaway defaults suite), then feeds
+synthetic media-control lines plus the live song through the app's own detection path and prints the
+resulting menu. `--focus-test` checks the browser navigation (it activates a browser, so run it on purpose):
+`--focus-test` follows what is playing now, `--focus-test "<title>"` a given song, `--focus-test --row N`
+row N of the real list, and `--focus-test --open-url` the stored-link branch — all through the same handler
+a click calls.
 
 ## Custom icon picture
 
