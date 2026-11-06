@@ -32,6 +32,11 @@ in **any browser** (Edge, Chrome, Safari… e.g. YouTube, YouTube Music, Spotify
   back to that song — the tab is selected if it is still open, and if it is not, the stored link is opened in
   the same browser. **Clear Recently Played** empties the list; turn the whole thing off in Settings to keep
   nothing.
+- A **seek bar** on the menu card shows the elapsed and remaining time and moves while the song plays.
+  Click or drag it to jump: the thumb follows your mouse, one seek is sent when you let go, and the thumb
+  stays where you clicked until the player catches up.
+- A **YouTube categories** submenu opens a YouTube search or feed (All, From same artist, Youth music, Rapping,
+  Related, For you, Recently uploaded) in your default browser. It is manual only; steering never uses it.
 - Runs as a background app (`LSUIElement`, no Dock icon).
 
 ## Settings
@@ -40,7 +45,7 @@ Open from the menu bar item (or by opening Song Notifier again if the item is hi
 **Launch at login** (a regular macOS login item, listed in System Settings → General → Login Items),
 **show the song in the menu bar**, **roll long titles**, the **menu bar size** (1x, 0.8x or 0.5x width),
 **show popups**
-(turn popups off to keep just the menu bar title), and **keep a list of recently played songs**.
+(turn popups off to keep just the menu bar title), **keep a list of recently played songs**, and **steer away from repeated songs automatically**. Song Notifier records lifetime play counts for every detected track in its local history, while showing only the newest 10 entries in the menu. Steering uses that full history to detect any previously played track; it never deletes or changes YouTube history. When steering is enabled, it skips a previously played track with the next-track command. It only does this within the first 5 seconds after a repeated track starts, never mid-song, and waits 45 seconds between automatic steering actions.
 
 ## Install
 

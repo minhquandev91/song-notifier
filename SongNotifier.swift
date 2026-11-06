@@ -19,7 +19,7 @@ if !snapshotMode, !historyTestMode, !focusTestMode, let id = Bundle.main.bundleI
 // MARK: - Settings (UserDefaults; every flag defaults to on)
 
 enum Flag: String {
-    case showPopups, showInMenuBar, scrollTitle, recentList
+    case showPopups, showInMenuBar, scrollTitle, recentList, steerListening
     var isOn: Bool { UserDefaults.standard.object(forKey: rawValue) as? Bool ?? true }
     func set(_ on: Bool) { UserDefaults.standard.set(on, forKey: rawValue) }
 }
@@ -64,6 +64,7 @@ let browserKinds = [
 
 // The link of a song is not in media-control's data, but while the song plays it is the URL of the browser
 // tab playing it — so it is read from the tab once per track and kept with the history row.
+// Last.fm credentials are stored in UserDefaults
 let tabURLScripts = [
     "chromium": """
         tell application id "%@"
@@ -116,7 +117,9 @@ func focusPlayer(bundleID: String?, pid: Int32?, title: String?) -> Bool {
     let app = pid.flatMap { NSRunningApplication(processIdentifier: $0) }
         ?? NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first
     app?.activate()
-    return selectedTab
+    // For non-browser players (e.g. Spotify), activating the app is the correct behavior.
+    // Return true so we don't fall through to openInPlayer (which would open a new tab).
+    return selectedTab || browserKinds[bundleID] == nil
 }
 
 // MARK: - Artwork
@@ -174,10 +177,11 @@ struct Track: Codable {
     }
 }
 
-// Newest first, de-duplicated by title+artist: hearing a song again moves it back to the top and counts a play.
-// Bounded so the store never grows (25 kept, 10 shown); no artwork — thumbnails would bloat UserDefaults.
+// Newest first, de-duplicated by title+artist: every observed play moves to the top and increments its lifetime count.
+// The full aggregate history is retained so steering can detect repeats across the entire listening history.
 enum History {
-    static let kept = 25, shown = 10
+    static let shown = 10
+    static let kept = Int.max
     private static let key = "recentlyPlayed"
     // swapped by --history-test so the check never touches the real list
     static var store = UserDefaults.standard
@@ -216,6 +220,14 @@ enum History {
         save()
     }
 
+    // Swaps the track at `index` with the current song (index 0).
+    // The clicked track moves to the top; the current song takes the clicked track's old position.
+    static func swapWithCurrent(at index: Int) {
+        guard index > 0, index < tracks.count else { return }
+        tracks.swapAt(0, index)
+        save()
+    }
+
     // Throwaway defaults suite the checks run against, so they never touch the real list.
     static let testSuite = "com.quan.songnotifier.history-test"
 
@@ -235,7 +247,7 @@ enum History {
         check(load().count == tracks.count, "survives a reload (persisted)")
         check(load().first?.url == "https://example.com/a", "the stored link survives a reload")
         for i in 0..<40 { add(title: "S\(i)", artist: "", url: nil, bundleID: nil, pid: nil) }
-        check(tracks.count == kept, "capped at \(kept) rows")
+        check(tracks.count == 42, "retains the full lifetime aggregate history")
         check(tracks.first?.title == "S39", "newest first")
         clear()
         check(tracks.isEmpty && load().isEmpty, "clear empties the list")
@@ -332,7 +344,7 @@ final class WaveView: NSView {
 
 // MARK: - App
 
-final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
+final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, UNUserNotificationCenterDelegate {
     let un = UNUserNotificationCenter.current()
 
     // Now Playing state is fed by `media-control stream` (brew install ungive/media-control/media-control),
@@ -341,12 +353,25 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserN
     var lastTrack = ""
     var pending: DispatchWorkItem?
     var helper: Process?
+    var steeringLastAction = Date.distantPast
+    let steeringCooldown: TimeInterval = 45
+    // Automatic steering is only allowed immediately after a track starts; never interrupt a song mid-playback.
+    var currentTrackStartedAt = Date.distantPast
+    let steeringWindow: TimeInterval = 5
     var buffer = Data()
 
     // menu bar
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     var statusMenu = NSMenu()
     var playPauseButton: NSButton?
+    var seekSlider: NSSlider?
+    // Position the user picked on the slider, shown instead of the player's until the player catches up.
+    // seekCommittedAt is nil while the mouse is still down (a preview), set once the seek was sent.
+    var seekTarget: Double?
+    var seekCommittedAt: Date?
+    var seekPickedAt = Date.distantPast
+    var elapsedLabel: NSTextField?
+    var remainingLabel: NSTextField?
     let artworkView = ArtworkView(frame: .zero)
     let waveView = WaveView(frame: .zero)
     let titleLabel = NSTextField(wrappingLabelWithString: "Not playing")
@@ -355,6 +380,13 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserN
     // Recently Played: the rows are rebuilt in menuWillOpen, so the menu never changes while it is closed.
     let recentMenuItem = NSMenuItem(title: "Recently Played", action: nil, keyEquivalent: "")
     let recentMenu = NSMenu()
+    // Recommendations: fetched from Last.fm on menu open (cached for 10 min).
+    let recommendMenuItem = NSMenuItem(title: "Recommendations", action: nil, keyEquivalent: "")
+    let recommendMenu = NSMenu()
+    let youtubeMenuItem = NSMenuItem(title: "YouTube categories", action: nil, keyEquivalent: "")
+    let youtubeMenu = NSMenu()
+    var lastRecommendationFetch: Date = .distantPast
+    var cachedRecommendations: [(title: String, artist: String, spotifyUri: String?)] = []
     // Banner width = 28 characters of a monospaced font (so the rolling text doesn't jiggle the bar) times
     // the size chosen in Settings.
     static let sizes: [(label: String, scale: Double)] = [("1x", 1.0), ("0.8x", 0.8), ("0.5x", 0.5)]
@@ -365,6 +397,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserN
     var menuBarChars: Int { Int((28 * menuBarScale).rounded()) }
     var scrollOffset = 0
     var ticker: Timer?
+    var progressTimer: Timer?
 
     // settings window
     var window: NSWindow?
@@ -373,6 +406,10 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserN
     var popupsBox: NSButton?
     var settingsStack: NSStackView?
     var sizeControl: NSSegmentedControl?
+    var spotifyClientIdField: NSTextField?
+    var spotifyClientSecretField: NSTextField?
+    var lastfmApiKeyField: NSTextField?
+    var lastfmUserField: NSTextField?
 
     var isPlaying: Bool { (state["playing"] as? Bool) == true }
     var songLine: String {
@@ -400,6 +437,21 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserN
             print("notification permission granted:", granted, err?.localizedDescription ?? "")
         }
 
+        // Set up a main menu with Edit menu for keyboard shortcuts (Cmd+C/V/X/A/Z)
+        let mainMenu = NSMenu()
+        let editMenuItem = NSMenuItem()
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        editMenu.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editMenuItem.submenu = editMenu
+        mainMenu.addItem(editMenuItem)
+        NSApp.mainMenu = mainMenu
+
         statusMenu = makeStatusMenu()
         statusItem.menu = statusMenu
         statusItem.button?.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
@@ -407,6 +459,10 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserN
             self?.scrollOffset += 1
             self?.refreshMenuBar()
         }
+        progressTimer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
+            self?.refreshPlaybackProgress()
+        }
+        if let progressTimer { RunLoop.main.add(progressTimer, forMode: .common) }
         refreshMenuBar()
 
         // don't leave the helper orphaned when we are stopped
@@ -521,15 +577,25 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserN
         let work = DispatchWorkItem { [self] in
             guard isPlaying, let name = state["title"] as? String, !name.isEmpty, name != lastTrack else { return }
             lastTrack = name
+            currentTrackStartedAt = Date()
             let artist = state["artist"] as? String ?? ""
             let album = state["album"] as? String ?? ""
             let bundleID = state["bundleIdentifier"] as? String
             let pid = state["processIdentifier"] as? Int32
-            // the history is not a notification, so it is recorded even with popups switched off.
-            // The link is read here, while that song is still the one in the tab.
-            if Flag.recentList.isOn {
-                History.add(title: name, artist: artist, url: playingURL(bundleID: bundleID, title: name),
-                            bundleID: bundleID, pid: pid)
+            let repeatedPreviously = History.tracks.contains {
+                $0.title == name && $0.artist == artist
+            }
+            // Record every observed play before steering, including tracks that are redirected.
+            // The full lifetime count is independent of the Recently Played visibility setting.
+            History.add(title: name, artist: artist, url: playingURL(bundleID: bundleID, title: name),
+                        bundleID: bundleID, pid: pid)
+            if Flag.steerListening.isOn && repeatedPreviously &&
+               Date().timeIntervalSince(currentTrackStartedAt) <= steeringWindow &&
+               Date().timeIntervalSince(steeringLastAction) > steeringCooldown {
+                steeringLastAction = Date()
+                print("Steering away from repeated track: \(name) — \(artist)")
+                control("next-track")
+                return
             }
             guard Flag.showPopups.isOn else { return }
             var player: [String: Any] = ["title": name]
@@ -584,6 +650,26 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserN
         waveView.heightAnchor.constraint(equalToConstant: waveView.intrinsicContentSize.height).isActive = true
         controls.translatesAutoresizingMaskIntoConstraints = false
 
+        let slider = NSSlider(value: 0, minValue: 0, maxValue: 1, target: self, action: #selector(seekChanged(_:)))
+        slider.isContinuous = true
+        slider.controlSize = .small
+        slider.allowsTickMarkValuesOnly = false
+        slider.numberOfTickMarks = 0
+        slider.toolTip = "Seek"
+        slider.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        slider.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        slider.translatesAutoresizingMaskIntoConstraints = false
+        seekSlider = slider
+        let elapsed = NSTextField(labelWithString: "0:00")
+        let remaining = NSTextField(labelWithString: "-0:00")
+        for label in [elapsed, remaining] {
+            label.font = .monospacedDigitSystemFont(ofSize: 10, weight: .regular)
+            label.textColor = .secondaryLabelColor
+            label.translatesAutoresizingMaskIntoConstraints = false
+        }
+        elapsedLabel = elapsed
+        remainingLabel = remaining
+
         titleLabel.font = .systemFont(ofSize: 15, weight: .semibold)
         titleLabel.lineBreakMode = .byWordWrapping  // wrap first; truncating mode would stop at one line
         titleLabel.maximumNumberOfLines = 2
@@ -598,7 +684,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserN
         artworkView.onClick = { [weak self] in self?.openPlayer() }
 
         let container = NSView(frame: NSRect(x: 0, y: 0, width: pad + art + gap + textWidth + pad, height: art + 2 * pad))
-        for v in [artworkView, titleLabel, artistLabel, controls] { container.addSubview(v) }
+        for v in [artworkView, titleLabel, artistLabel, controls, slider, elapsed, remaining] { container.addSubview(v) }
         let textLeading = artworkView.trailingAnchor
         NSLayoutConstraint.activate([
             artworkView.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: pad),
@@ -612,13 +698,47 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserN
             artistLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
             artistLabel.widthAnchor.constraint(equalToConstant: textWidth),
             artistLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 2),
+            artistLabel.bottomAnchor.constraint(lessThanOrEqualTo: slider.topAnchor, constant: -2),
 
             // the first glyph sits ~3pt inside its button; shift the row left so the glyph lines up with the text
             controls.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor, constant: -3),
             controls.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
             controls.bottomAnchor.constraint(equalTo: artworkView.bottomAnchor, constant: 2),
+            slider.leadingAnchor.constraint(equalTo: elapsed.trailingAnchor, constant: 6),
+            slider.trailingAnchor.constraint(equalTo: remaining.leadingAnchor, constant: -6),
+            slider.bottomAnchor.constraint(equalTo: controls.topAnchor, constant: -2),
+            elapsed.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            elapsed.centerYAnchor.constraint(equalTo: slider.centerYAnchor),
+            remaining.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
+            remaining.centerYAnchor.constraint(equalTo: slider.centerYAnchor),
         ])
+        slider.heightAnchor.constraint(equalToConstant: 18).isActive = true
         return container
+    }
+
+    @objc func seekChanged(_ slider: NSSlider) {
+        guard let duration = state["duration"] as? Double, duration > 0 else { return }
+        let target = slider.doubleValue * duration
+        seekTarget = target
+        seekPickedAt = Date()
+        // Mouse down / drag only preview the position; the seek is sent once, on release.
+        let type = NSApp.currentEvent?.type
+        if type == .leftMouseDown || type == .leftMouseDragged {
+            seekCommittedAt = nil
+        } else {
+            seekCommittedAt = Date()
+            control("seek", argument: target)
+        }
+        refreshPlaybackProgress()
+    }
+
+    func control(_ command: String, argument: Double) {
+        guard let tool = mediaControlURL else { return }
+        let p = Process()
+        p.executableURL = tool
+        // media-control rejects any number written as "0.x" (it parses ".5"), so seek in whole seconds.
+        p.arguments = [command, String(max(0, Int(argument.rounded())))]
+        try? p.run()
     }
 
     // Artwork clicked: close the menu and bring the player (and, for browsers, the song's tab) to the front.
@@ -649,6 +769,12 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserN
         recentMenuItem.submenu = recentMenu
         recentMenu.delegate = self
         menu.addItem(recentMenuItem)
+        recommendMenuItem.submenu = recommendMenu
+        recommendMenu.delegate = self
+        menu.addItem(recommendMenuItem)
+        youtubeMenuItem.submenu = youtubeMenu
+        youtubeMenu.delegate = self
+        menu.addItem(youtubeMenuItem)
         menu.addItem(withTitle: "Settings…", action: #selector(showSettings), keyEquivalent: ",").target = self
         menu.addItem(withTitle: "Quit Song Notifier", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         return menu
@@ -656,33 +782,83 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserN
 
     // Rebuilt on every open: the rows always match History, without touching the menu while it is closed.
     func menuWillOpen(_ menu: NSMenu) {
-        guard menu === recentMenu else { return }
-        recentMenu.removeAllItems()
-        let recent = Array(History.tracks.prefix(History.shown))
-        if recent.isEmpty {
-            let empty = NSMenuItem(title: "Nothing played yet", action: nil, keyEquivalent: "")
-            empty.isEnabled = false
-            recentMenu.addItem(empty)
+        if menu === recentMenu {
+            recentMenu.removeAllItems()
+            let recent = Array(History.tracks.prefix(History.shown))
+            if recent.isEmpty {
+                let empty = NSMenuItem(title: "Nothing played yet", action: nil, keyEquivalent: "")
+                empty.isEnabled = false
+                recentMenu.addItem(empty)
+            }
+            for t in recent {
+                let item = NSMenuItem(title: t.line, action: #selector(openRecent(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = t
+                item.toolTip = "Open the player"
+                recentMenu.addItem(item)
+            }
+            recentMenu.addItem(.separator())
+            let clear = NSMenuItem(title: "Clear Recently Played", action: #selector(clearRecent), keyEquivalent: "")
+            clear.target = self
+            clear.isEnabled = !recent.isEmpty
+            recentMenu.addItem(clear)
+        } else if menu === recommendMenu {
+            buildRecommendationsMenu()
+        } else if menu === youtubeMenu {
+            buildYouTubeCategoriesMenu()
         }
-        for t in recent {
-            let item = NSMenuItem(title: t.line, action: #selector(openRecent(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = t
-            item.toolTip = "Open the player"
-            recentMenu.addItem(item)
-        }
-        recentMenu.addItem(.separator())
-        let clear = NSMenuItem(title: "Clear Recently Played", action: #selector(clearRecent), keyEquivalent: "")
-        clear.target = self
-        clear.isEnabled = !recent.isEmpty
-        recentMenu.addItem(clear)
     }
 
-    // Clicking a row goes back to that song: the tab is selected if it is still open, otherwise the link
-    // stored with the row is opened in the player's browser. Returns true when the song was reached.
+    func buildYouTubeCategoriesMenu() {
+        youtubeMenu.removeAllItems()
+        let categories = [
+            ("All", "https://www.youtube.com/results?search_query=music"),
+            ("From same artist", "https://www.youtube.com/results?search_query=" + ((state["artist"] as? String ?? "music").addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "music")),
+            ("Youth music", "https://www.youtube.com/results?search_query=youth+music"),
+            ("Rapping", "https://www.youtube.com/results?search_query=rapping+music"),
+            ("Related", "https://www.youtube.com/results?search_query=related+music"),
+            ("For you", "https://www.youtube.com/feed/personalized"),
+            ("Recently uploaded", "https://www.youtube.com/results?sp=CAI%253D")
+        ]
+        for (title, address) in categories {
+            let item = NSMenuItem(title: title, action: #selector(openYouTubeCategory(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = address
+            youtubeMenu.addItem(item)
+        }
+    }
+
+    func openYouTubeCategory(at index: Int, artist: String) {
+        let queryArtist = artist.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "music"
+        let addresses = [
+            "https://www.youtube.com/results?search_query=music",
+            "https://www.youtube.com/results?search_query=\(queryArtist)",
+            "https://www.youtube.com/results?search_query=youth+music",
+            "https://www.youtube.com/results?search_query=rapping+music",
+            "https://www.youtube.com/results?search_query=related+music",
+            "https://www.youtube.com/feed/personalized",
+            "https://www.youtube.com/results?sp=CAI%253D"
+        ]
+        guard addresses.indices.contains(index), let url = URL(string: addresses[index]) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    @objc func openYouTubeCategory(_ sender: NSMenuItem) {
+        guard let address = sender.representedObject as? String,
+              let url = URL(string: address) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    // Clicking a row swaps it with the current song (index 0), then goes back to that song:
+    // the tab is selected if it is still open, otherwise the link stored with the row is opened.
+    // Returns true when the song was reached.
     @discardableResult
     @objc func openRecent(_ item: NSMenuItem) -> Bool {
         guard let t = item.representedObject as? Track else { return false }
+        // swap the clicked row with the current song (index 0)
+        if let idx = History.tracks.firstIndex(where: { $0.title == t.title && $0.artist == t.artist }) {
+            History.swapWithCurrent(at: idx)
+        }
         if focusPlayer(bundleID: t.bundleID, pid: t.pid, title: t.title) { return true }
         guard let url = t.url, let target = URL(string: url) else { return false }
         return openInPlayer(target, bundleID: t.bundleID)
@@ -700,6 +876,357 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserN
 
     @objc func clearRecent() { History.clear() }
 
+    // MARK: - Recommendations from Last.fm
+
+    func buildRecommendationsMenu() {
+        recommendMenu.removeAllItems()
+
+        // Use cache if fresh (< 10 minutes old)
+        if Date().timeIntervalSince(lastRecommendationFetch) < 600 && !cachedRecommendations.isEmpty {
+            populateRecommendationsMenu()
+            return
+        }
+
+        // Show loading state
+        let loading = NSMenuItem(title: "Loading recommendations…", action: nil, keyEquivalent: "")
+        loading.isEnabled = false
+        recommendMenu.addItem(loading)
+
+        // Fetch from Last.fm in background
+        fetchLastFMRecommendations { [weak self] recommendations in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.cachedRecommendations = recommendations
+                self.lastRecommendationFetch = Date()
+                self.populateRecommendationsMenu()
+            }
+        }
+    }
+
+    func populateRecommendationsMenu() {
+        recommendMenu.removeAllItems()
+
+        if cachedRecommendations.isEmpty {
+            let empty = NSMenuItem(title: "No recommendations available", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            recommendMenu.addItem(empty)
+            return
+        }
+
+        for rec in cachedRecommendations {
+            let title = rec.title.isEmpty ? "Unknown" : rec.title
+            let artist = rec.artist.isEmpty ? "Unknown Artist" : rec.artist
+            let displayText = "\(title) — \(artist)"
+
+            let item = NSMenuItem(title: displayText, action: #selector(openRecommendation(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = rec
+            item.toolTip = "Play in music player"
+            recommendMenu.addItem(item)
+        }
+
+        recommendMenu.addItem(.separator())
+        let refresh = NSMenuItem(title: "Refresh Recommendations", action: #selector(refreshRecommendations), keyEquivalent: "")
+        refresh.target = self
+        recommendMenu.addItem(refresh)
+    }
+
+    @objc func openRecommendation(_ sender: NSMenuItem) {
+        guard let rec = sender.representedObject as? (title: String, artist: String, spotifyUri: String?) else { return }
+        
+        if let spotifyUri = rec.spotifyUri, !spotifyUri.isEmpty {
+            // Check if Spotify app is installed
+            if let spotifyURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.spotify.client") {
+                // Spotify app is installed, open in app using URI scheme
+                if let url = URL(string: spotifyUri) {
+                    NSWorkspace.shared.open(url)
+                }
+            } else {
+                // Spotify app not installed, open in web player
+                openSpotifyWebTrack(uri: spotifyUri)
+            }
+        } else {
+            // No Spotify URI, open web search
+            openSpotifyWebSearch(query: "\(rec.title) \(rec.artist)")
+        }
+    }
+    
+    private func openSpotifyWebTrack(uri: String) {
+        // Convert spotify:track:xxx to https://open.spotify.com/track/xxx
+        let trackId = uri.replacingOccurrences(of: "spotify:track:", with: "")
+        let webURL = "https://open.spotify.com/track/\(trackId)"
+        if let url = URL(string: webURL) {
+            NSWorkspace.shared.open(url)
+        }
+    }
+    
+    private func openSpotifyWebSearch(query: String) {
+        let encodedQuery = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+        let searchURL = "https://open.spotify.com/search/\(encodedQuery)"
+        if let url = URL(string: searchURL) {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    @objc func refreshRecommendations() {
+        lastRecommendationFetch = .distantPast
+        buildRecommendationsMenu()
+    }
+
+    @objc func saveLastfmCredentials() {
+        let apiKey = lastfmApiKeyField?.stringValue ?? ""
+        let user = lastfmUserField?.stringValue ?? ""
+        UserDefaults.standard.set(apiKey, forKey: "lastfmApiKey")
+        UserDefaults.standard.set(user, forKey: "lastfmUser")
+        
+        let alert = NSAlert()
+        alert.messageText = "Last.fm Credentials Saved"
+        alert.informativeText = "Your Last.fm API credentials have been saved successfully."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "OK")
+        alert.beginSheetModal(for: window!) { _ in }
+    }
+
+    @objc func saveSpotifyCredentials() {
+        let clientId = spotifyClientIdField?.stringValue ?? ""
+        let clientSecret = spotifyClientSecretField?.stringValue ?? ""
+        
+        UserDefaults.standard.set(clientId, forKey: "spotifyClientId")
+        UserDefaults.standard.set(clientSecret, forKey: "spotifyClientSecret")
+        
+        let alert = NSAlert()
+        alert.messageText = "Spotify Credentials Saved"
+        alert.informativeText = "Your Spotify API credentials have been saved successfully."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "OK")
+        alert.beginSheetModal(for: window!) { _ in }
+    }
+
+    func fetchLastFMRecommendations(completion: @escaping ([(title: String, artist: String, spotifyUri: String?)]) -> Void) {
+        let lastfmAPIKey = UserDefaults.standard.string(forKey: "lastfmApiKey") ?? ""
+        let lastfmUser = UserDefaults.standard.string(forKey: "lastfmUser") ?? ""
+        
+        guard !lastfmAPIKey.isEmpty && !lastfmUser.isEmpty else {
+            completion([])
+            return
+        }
+        
+        let encodedUser = lastfmUser.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? lastfmUser
+        let recentURL = "https://ws.audioscrobbler.com/2.0/?method=user.getrecenttracks&user=\(encodedUser)&api_key=\(lastfmAPIKey)&format=json&limit=20"
+
+        guard let url = URL(string: recentURL) else {
+            completion([])
+            return
+        }
+
+        let task = URLSession.shared.dataTask(with: url) { data, response, error in
+            guard let data = data, error == nil else {
+                completion([])
+                return
+            }
+
+            do {
+                guard let json = try JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
+                      let recentTracks = json["recenttracks"] as? [String: Any],
+                      let tracks = recentTracks["track"] as? [[String: Any]] else {
+                    completion([])
+                    return
+                }
+
+                // Extract unique artists from recent tracks
+                var seenArtists = Set<String>()
+                var artists: [String] = []
+                for track in tracks {
+                    let artistInfo = track["artist"] as? [String: Any]
+                    let artist = artistInfo?["#text"] as? String ?? ""
+                    if !artist.isEmpty && !seenArtists.contains(artist) {
+                        seenArtists.insert(artist)
+                        artists.append(artist)
+                    }
+                    if artists.count >= 3 { break }  // Use up to 3 artists as seeds
+                }
+
+                guard !artists.isEmpty else {
+                    completion([])
+                    return
+                }
+
+                // Fetch similar artists and their top tracks in parallel
+                let group = DispatchGroup()
+                var allRecommendations: [(title: String, artist: String, spotifyUri: String?)] = []
+                let lock = NSLock()
+
+                for artist in artists {
+                    group.enter()
+                    let encArtist = artist.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? artist
+                    let similarArtistsURL = "https://ws.audioscrobbler.com/2.0/?method=artist.getsimilar&artist=\(encArtist)&api_key=\(lastfmAPIKey)&format=json&limit=3"
+
+                    guard let simArtURL = URL(string: similarArtistsURL) else {
+                        group.leave()
+                        continue
+                    }
+
+                    URLSession.shared.dataTask(with: simArtURL) { simData, _, _ in
+                        defer { group.leave() }
+                        guard let simData = simData,
+                              let simJSON = try? JSONSerialization.jsonObject(with: simData, options: []) as? [String: Any],
+                              let similar = simJSON["similarartists"] as? [String: Any],
+                              let simArtists = similar["artist"] as? [[String: Any]] else { return }
+
+                        // For each similar artist, fetch their top tracks
+                        for simArtist in simArtists.prefix(2) {
+                            let simArtistName = simArtist["name"] as? String ?? ""
+                            guard !simArtistName.isEmpty else { continue }
+
+                            group.enter()
+                            let encSimArtist = simArtistName.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? simArtistName
+                            let topTracksURL = "https://ws.audioscrobbler.com/2.0/?method=artist.gettoptracks&artist=\(encSimArtist)&api_key=\(lastfmAPIKey)&format=json&limit=3"
+
+                            guard let topURL = URL(string: topTracksURL) else {
+                                group.leave()
+                                continue
+                            }
+
+                            URLSession.shared.dataTask(with: topURL) { topData, _, _ in
+                                defer { group.leave() }
+                                guard let topData = topData,
+                                      let topJSON = try? JSONSerialization.jsonObject(with: topData, options: []) as? [String: Any],
+                                      let topTracks = topJSON["toptracks"] as? [String: Any],
+                                      let topList = topTracks["track"] as? [[String: Any]] else { return }
+
+                                for tt in topList {
+                                    let name = tt["name"] as? String ?? ""
+                                    let ttURL = tt["url"] as? String ?? ""
+                                    guard !name.isEmpty else { continue }
+
+                                    lock.lock()
+                                    if !allRecommendations.contains(where: { $0.title == name && $0.artist == simArtistName }) {
+                                        allRecommendations.append((title: name, artist: simArtistName, spotifyUri: nil))
+                                    }
+                                    lock.unlock()
+                                }
+                            }.resume()
+                        }
+                    }.resume()
+                }
+
+                group.notify(queue: .main) {
+                    // Now search Spotify for each recommendation to get track URIs
+                    let spotifyGroup = DispatchGroup()
+                    
+                    // Get Spotify credentials from UserDefaults
+                    let clientId = UserDefaults.standard.string(forKey: "spotifyClientId") ?? ""
+                    let clientSecret = UserDefaults.standard.string(forKey: "spotifyClientSecret") ?? ""
+                    
+                    guard !clientId.isEmpty && !clientSecret.isEmpty else {
+                        completion(Array(allRecommendations.prefix(15)))
+                        return
+                    }
+                    
+                    // First get Spotify access token
+                    let tokenURL = "https://accounts.spotify.com/api/token"
+                    var request = URLRequest(url: URL(string: tokenURL)!)
+                    request.httpMethod = "POST"
+                    let credentials = "\(clientId):\(clientSecret)"
+                    let base64Credentials = credentials.data(using: .utf8)!.base64EncodedString()
+                    request.setValue("Basic \(base64Credentials)", forHTTPHeaderField: "Authorization")
+                    request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+                    request.httpBody = "grant_type=client_credentials".data(using: .utf8)
+                    
+                    URLSession.shared.dataTask(with: request) { tokenData, _, _ in
+                        guard let tokenData = tokenData,
+                              let tokenJSON = try? JSONSerialization.jsonObject(with: tokenData, options: []) as? [String: Any],
+                              let accessToken = tokenJSON["access_token"] as? String else {
+                            completion(Array(allRecommendations.prefix(15)))
+                            return
+                        }
+                        
+                        // Search for each track
+                        for i in 0..<allRecommendations.count {
+                            spotifyGroup.enter()
+                            let rec = allRecommendations[i]
+                            let query = "\(rec.title) \(rec.artist)"
+                            let encodedQuery = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+                            let searchURL = "https://api.spotify.com/v1/search?q=\(encodedQuery)&type=track&limit=1"
+                            
+                            var searchRequest = URLRequest(url: URL(string: searchURL)!)
+                            searchRequest.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+                            
+                            URLSession.shared.dataTask(with: searchRequest) { searchData, _, _ in
+                                defer { spotifyGroup.leave() }
+                                guard let searchData = searchData,
+                                      let searchJSON = try? JSONSerialization.jsonObject(with: searchData, options: []) as? [String: Any],
+                                      let tracks = searchJSON["tracks"] as? [String: Any],
+                                      let items = tracks["items"] as? [[String: Any]],
+                                      let firstTrack = items.first,
+                                      let uri = firstTrack["uri"] as? String else { return }
+                                
+                                lock.lock()
+                                allRecommendations[i] = (title: rec.title, artist: rec.artist, spotifyUri: uri)
+                                lock.unlock()
+                            }.resume()
+                        }
+                        
+                        spotifyGroup.notify(queue: .main) {
+                            completion(Array(allRecommendations.prefix(15)))
+                        }
+                    }.resume()
+                }
+            } catch {
+                completion([])
+            }
+        }
+
+        task.resume()
+    }
+
+
+    func formatTime(_ seconds: Double) -> String {
+        let total = max(0, Int(seconds.rounded()))
+        return "\(total / 60):\(String(format: "%02d", total % 60))"
+    }
+
+    // Stream updates provide elapsedTime and timestamp; calculate live progress between updates.
+    func currentElapsedTime() -> Double? {
+        if let value = state["elapsedTimeNow"] as? Double { return value }
+        guard let elapsed = state["elapsedTime"] as? Double,
+              let timestamp = state["timestamp"] as? String,
+              let date = ISO8601DateFormatter().date(from: timestamp) else { return nil }
+        let rate = state["playbackRate"] as? Double ?? 1
+        return elapsed + max(0, Date().timeIntervalSince(date)) * rate
+    }
+
+    // The only place that writes the slider and its time labels, so nothing can fight the user's pick.
+    func refreshPlaybackProgress() {
+        guard let duration = state["duration"] as? Double, duration > 0 else {
+            seekTarget = nil
+            seekCommittedAt = nil
+            seekSlider?.doubleValue = 0
+            seekSlider?.isEnabled = false
+            elapsedLabel?.stringValue = "0:00"
+            remainingLabel?.stringValue = "-0:00"
+            return
+        }
+        let live = currentElapsedTime().map { min(max($0, 0), duration) }
+        var shown = live ?? 0
+        if let target = seekTarget {
+            // Hold the picked position until the player reports it. Give up after 5 s (a seek the player ignored,
+            // or a menu that closed mid-drag) so the slider can never stay stuck.
+            let arrived = seekCommittedAt != nil && (live.map { abs($0 - target) < 2.5 } ?? false)
+            if arrived || Date().timeIntervalSince(seekPickedAt) > 5 {
+                seekTarget = nil
+                seekCommittedAt = nil
+            } else {
+                shown = min(max(target, 0), duration)
+            }
+        }
+        seekSlider?.isEnabled = true
+        // while dragging, AppKit owns the thumb
+        if seekCommittedAt != nil || seekTarget == nil { seekSlider?.doubleValue = shown / duration }
+        elapsedLabel?.stringValue = formatTime(shown)
+        remainingLabel?.stringValue = "-\(formatTime(max(duration - shown, 0)))"
+    }
+
     func refreshMenuBar() {
         statusItem.isVisible = Flag.showInMenuBar.isOn
         recentMenuItem.isHidden = !Flag.recentList.isOn
@@ -712,6 +1239,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserN
         let symbol = isPlaying ? "pause.fill" : "play.fill"
         playPauseButton?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Play / Pause")
         waveView.isActive = isPlaying
+        refreshPlaybackProgress()
         guard statusItem.isVisible, let button = statusItem.button else { return }
 
         guard !line.isEmpty else { button.title = "♫"; return }
@@ -739,6 +1267,13 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserN
         window?.makeFirstResponder(nil)  // no focus ring on the first checkbox when the window opens
     }
 
+    // MARK: - NSWindowDelegate
+    
+    func windowWillClose(_ notification: Notification) {
+        // Window is closing, just let it close
+        window = nil
+    }
+
     func checkbox(_ title: String, _ action: Selector) -> NSButton {
         let b = NSButton(checkboxWithTitle: title, target: self, action: action)
         return b
@@ -750,10 +1285,12 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserN
         let scroll = checkbox("Roll long titles across the menu bar", #selector(toggleScroll(_:)))
         let popups = checkbox("Show a popup when the song changes", #selector(togglePopups(_:)))
         let recent = checkbox("Keep a list of recently played songs", #selector(toggleRecent(_:)))
+        let steer = checkbox("Steer away from repeated songs automatically", #selector(toggleSteering(_:)))
         menubar.state = Flag.showInMenuBar.isOn ? .on : .off
         scroll.state = Flag.scrollTitle.isOn ? .on : .off
         popups.state = Flag.showPopups.isOn ? .on : .off
         recent.state = Flag.recentList.isOn ? .on : .off
+        steer.state = Flag.steerListening.isOn ? .on : .off
         popupsBox = popups
         loginBox = login
 
@@ -771,6 +1308,66 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserN
         copyright.font = .systemFont(ofSize: 11)
         copyright.textColor = .tertiaryLabelColor
 
+        // Last.fm API credentials
+        let lastfmTitle = NSTextField(labelWithString: "Last.fm API Credentials")
+        lastfmTitle.font = .systemFont(ofSize: 12, weight: .medium)
+        
+        let lastfmApiKeyLabel = NSTextField(labelWithString: "API Key:")
+        let lastfmApiKeyField = NSTextField()
+        lastfmApiKeyField.isEditable = true
+        lastfmApiKeyField.isSelectable = true
+        lastfmApiKeyField.placeholderString = "Enter Last.fm API Key"
+        lastfmApiKeyField.stringValue = UserDefaults.standard.string(forKey: "lastfmApiKey") ?? ""
+        lastfmApiKeyField.widthAnchor.constraint(equalToConstant: 300).isActive = true
+        self.lastfmApiKeyField = lastfmApiKeyField
+        
+        let lastfmUserLabel = NSTextField(labelWithString: "Username:")
+        let lastfmUserField = NSTextField()
+        lastfmUserField.isEditable = true
+        lastfmUserField.isSelectable = true
+        lastfmUserField.placeholderString = "Enter Last.fm Username"
+        lastfmUserField.stringValue = UserDefaults.standard.string(forKey: "lastfmUser") ?? ""
+        lastfmUserField.widthAnchor.constraint(equalToConstant: 300).isActive = true
+        self.lastfmUserField = lastfmUserField
+        
+        let saveLastfmButton = NSButton(title: "Save", target: self, action: #selector(saveLastfmCredentials))
+        saveLastfmButton.bezelStyle = .rounded
+        
+        let lastfmStack = NSStackView(views: [lastfmTitle, lastfmApiKeyLabel, lastfmApiKeyField, lastfmUserLabel, lastfmUserField, saveLastfmButton])
+        lastfmStack.orientation = .vertical
+        lastfmStack.alignment = .leading
+        lastfmStack.spacing = 6
+        
+        // Spotify API credentials
+        let spotifyTitle = NSTextField(labelWithString: "Spotify API Credentials")
+        spotifyTitle.font = .systemFont(ofSize: 12, weight: .medium)
+        
+        let clientIdLabel = NSTextField(labelWithString: "Client ID:")
+        let clientIdField = NSTextField()
+        clientIdField.isEditable = true
+        clientIdField.isSelectable = true
+        clientIdField.placeholderString = "Enter Spotify Client ID"
+        clientIdField.stringValue = UserDefaults.standard.string(forKey: "spotifyClientId") ?? ""
+        clientIdField.widthAnchor.constraint(equalToConstant: 300).isActive = true
+        spotifyClientIdField = clientIdField
+        
+        let clientSecretLabel = NSTextField(labelWithString: "Client Secret:")
+        let clientSecretField = NSTextField()
+        clientSecretField.isEditable = true
+        clientSecretField.isSelectable = true
+        clientSecretField.placeholderString = "Enter Spotify Client Secret"
+        clientSecretField.stringValue = UserDefaults.standard.string(forKey: "spotifyClientSecret") ?? ""
+        clientSecretField.widthAnchor.constraint(equalToConstant: 300).isActive = true
+        spotifyClientSecretField = clientSecretField
+        
+        let saveSpotifyButton = NSButton(title: "Save", target: self, action: #selector(saveSpotifyCredentials))
+        saveSpotifyButton.bezelStyle = .rounded
+        
+        let spotifyStack = NSStackView(views: [spotifyTitle, clientIdLabel, clientIdField, clientSecretLabel, clientSecretField, saveSpotifyButton])
+        spotifyStack.orientation = .vertical
+        spotifyStack.alignment = .leading
+        spotifyStack.spacing = 6
+        
         // menu bar size presets, indented to line up with the checkbox titles above
         let sizeTitle = NSTextField(labelWithString: "Menu bar size")
         let size = NSSegmentedControl(labels: Controller.sizes.map { $0.label }, trackingMode: .selectOne,
@@ -784,7 +1381,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserN
         widthRow.spacing = 12
         widthRow.edgeInsets = NSEdgeInsets(top: 0, left: 21, bottom: 0, right: 0)
 
-        let stack = NSStackView(views: [login, note, menubar, scroll, widthRow, popups, recent, hint, copyright])
+        let stack = NSStackView(views: [login, note, menubar, scroll, widthRow, popups, recent, steer, lastfmStack, spotifyStack, hint, copyright])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 10
@@ -796,8 +1393,13 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserN
         // wrapping labels need a real width, or the window grows to the text and the right inset disappears
         for label in [hint, note] { label.widthAnchor.constraint(equalToConstant: 304).isActive = true }
 
-        let w = NSWindow(contentRect: .zero, styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        let w = NSWindow(contentRect: .zero, styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         w.title = "Song Notifier"
+        w.isReleasedWhenClosed = false
+        w.delegate = self
+        w.center()
+        w.makeKeyAndOrderFront(nil)
+        w.level = .normal
         // explicit margins: the window sizes itself from this container, and NSStackView's own insets
         // left the right-hand margin out of its fitting size
         let content = NSView()
@@ -1052,6 +1654,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserN
     @objc func toggleRecent(_ s: NSButton) {
         Flag.recentList.set(s.state == .on)
         refreshMenuBar()  // shows/hides the Recently Played submenu
+    }
+    @objc func toggleSteering(_ s: NSButton) {
+        Flag.steerListening.set(s.state == .on)
     }
 
     // one place keeps the menu item and the settings checkbox in step; popups off still keeps the menu bar title
